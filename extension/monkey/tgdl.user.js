@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         tgdl 下载器（Telegram Web）
 // @namespace    tgdl
-// @version      1.0.1
+// @version      1.0.3
 // @description  在 Telegram Web 的视频/文件/图片消息下加「下载」按钮，交给本地 tgdl 服务用多账号并行下载
 // @match        https://web.telegram.org/a/*
 // @match        https://web.telegram.org/k/*
@@ -195,6 +195,10 @@
   button.pri { padding: 6px 12px; border-radius: 6px; border: 0; background: #111; color: #fff; font: inherit; cursor: pointer; }
   button.pri:disabled { opacity: .5; cursor: default; }
   button.ghost { padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(0,0,0,.15); background: #fff; font: inherit; cursor: pointer; }
+  .acts { display: flex; gap: 6px; margin-top: 8px; }
+  .acts button { padding: 3px 9px; border-radius: 6px; border: 1px solid rgba(0,0,0,.15); background: #fff; font: inherit; font-size: 12px; cursor: pointer; }
+  .acts button:hover { background: #f2f2f2; }
+  .acts button:disabled { opacity: .5; cursor: default; }
   .hint { color: #777; font-size: 12px; }
   .err { color: #c0392b; font-size: 12px; }
   `;
@@ -246,7 +250,6 @@
       <div class="tabs">
         <button data-tab="tasks" class="sel">下载</button>
         <button data-tab="settings">设置</button>
-        <button data-tab="login">登录</button>
       </div>
       <div class="body" id="body"></div>
     `;
@@ -303,7 +306,7 @@
       dot.className = 'dot on';
       dot.title = '本地服务已连接';
       const active = panel.querySelector('.tabs button.sel')?.dataset.tab;
-      if (active === 'tasks' || active === 'login') render(active);
+      if (active) render(active);
       return lastState;
     } catch (e) {
       const dot = shadow.querySelector('#dot');
@@ -316,34 +319,91 @@
   function render(tab) {
     const body = shadow.querySelector('#body');
     if (!body) return;
+    // 切换标签时必须清掉 sig，否则 renderTasks 会以为「任务没变」而跳过重建，
+    // body 里留着上一个标签的内容（表现为切回下载页没反应）。
+    if (body.dataset.tab !== tab) {
+      body.dataset.tab = tab;
+      body.dataset.sig = '';
+      body.innerHTML = '';
+    }
     if (tab === 'tasks') return renderTasks(body);
     if (tab === 'settings') return renderSettings(body);
-    if (tab === 'login') return renderLogin(body);
+  }
+
+  const STATUS_TEXT = {
+    queued: '排队中', running: '下载中', stopping: '正在停止',
+    stopped: '已停止', done: '已完成', failed: '失败',
+  };
+
+  function esc(t) {
+    return String(t == null ? '' : t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   }
 
   function renderTasks(body) {
     const tasks = (lastState && lastState.tasks) || [];
     if (!tasks.length) {
-      body.innerHTML = `<div class="hint">还没有任务。<br>在聊天里的图片/视频/文件上点「⬇ tgdl」。</div>`;
+      if (body.dataset.sig !== 'empty') {
+        body.dataset.sig = 'empty';
+        body.innerHTML = `<div class="hint">还没有任务。<br>在聊天里的图片/视频/文件上点「⬇ tgdl」。</div>`;
+      }
       return;
     }
-    body.innerHTML = tasks.map((t) => {
+    // 只有任务集合变了才重建 DOM，否则只改文字和进度条（避免闪烁）
+    const sig = tasks.map((t) => t.id).join(',');
+    if (body.dataset.sig !== sig) {
+      body.dataset.sig = sig;
+      body.innerHTML = tasks.map((t) => `
+        <div class="task" data-id="${t.id}">
+          <div class="n">${esc(t.name || t.target)}</div>
+          <div class="m"><span class="st"></span> · <span class="mt"></span></div>
+          <div class="bar"><i></i></div>
+          <div class="acts">
+            <button class="ghost" data-act="cancel" data-id="${t.id}">停止</button>
+            <button class="ghost" data-act="resume" data-id="${t.id}">继续</button>
+            <button class="ghost" data-act="remove" data-id="${t.id}">删除</button>
+          </div>
+        </div>`).join('');
+      body.querySelectorAll('button[data-act]').forEach((b) => {
+        b.addEventListener('click', onTaskAction);
+      });
+    }
+    for (const t of tasks) {
+      const node = body.querySelector(`.task[data-id="${t.id}"]`);
+      if (!node) continue;
       const pct = t.size ? Math.min(100, (t.done / t.size) * 100) : 0;
+      node.querySelector('.st').textContent = STATUS_TEXT[t.status] || t.status;
       const speed = t.speed > 0 ? ` · ${fmtSize(t.speed)}/s` : '';
       const meta = t.status === 'done'
-        ? `${fmtSize(t.size)} · 已完成`
+        ? fmtSize(t.size)
         : t.status === 'failed'
-          ? `<span class="err">${t.error || '失败'}</span>`
+          ? esc(t.error || '失败')
           : `${fmtSize(t.done)} / ${fmtSize(t.size)}${speed}`;
-      return `<div class="task">
-        <div class="n">${t.name || t.target}</div>
-        <div class="m">${t.status} · ${meta}</div>
-        <div class="bar"><i style="width:${pct}%"></i></div>
-      </div>`;
-    }).join('');
+      node.querySelector('.mt').textContent = meta;
+      node.querySelector('.bar i').style.width = pct + '%';
+      node.querySelector('.bar i').style.background = t.status === 'failed' ? '#d24b4b' : '#1a9e5f';
+      node.querySelector('[data-act="cancel"]').style.display = (t.status === 'running' || t.status === 'queued') ? '' : 'none';
+      node.querySelector('[data-act="resume"]').style.display = (t.status === 'stopped' || t.status === 'failed') ? '' : 'none';
+    }
+  }
+
+  async function onTaskAction(ev) {
+    const btn = ev.currentTarget;
+    const { id, act } = btn.dataset;
+    btn.disabled = true;
+    try {
+      await api('/api/tasks/' + act, { id });
+      await refreshState();
+    } catch (e) {
+      btn.title = String(e.message || e);
+    } finally {
+      btn.disabled = false;
+    }
   }
 
   function renderSettings(body) {
+    // 轮询时不要重建：否则会把用户正在输入的内容和提示信息清掉
+    if (body.dataset.sig === 'settings') return;
+    body.dataset.sig = 'settings';
     const st = (lastState && lastState.settings) || {};
     body.innerHTML = `
       <div class="row"><label>服务地址</label><input type="text" id="srv" value="${cfg.server}"></div>
@@ -367,7 +427,12 @@
       store.set('token', cfg.token);
       try {
         const r = await api('/api/ping');
-        msg.innerHTML = `<span style="color:#1a9e5f">连上了，服务版本 ${r.version}</span>`;
+        const acc = await api('/api/account/refresh', {});
+        const who = acc.account && acc.account.fast;
+        const err = acc.account && acc.account.error;
+        msg.innerHTML = err
+          ? `<span class="err">服务在跑，但连不上 Telegram：${err}</span>`
+          : `<span style="color:#1a9e5f">连上了，服务版本 ${r.version}｜账号 ${who || '未登录'}</span>`;
         refreshState();
       } catch (e) {
         msg.innerHTML = `<span class="err">${e.message || e}</span>`;
@@ -394,56 +459,6 @@
     });
   }
 
-  function renderLogin(body) {
-    const lg = (lastState && lastState.login) || { phase: 'idle' };
-    const acc = (lastState && lastState.account) || {};
-    let html = `<div class="hint">当前账号：${acc.fast || '未登录'}<br>已缓存 auth key：${acc.auth_keys_cached || 0} 条</div>`;
-    if (lg.phase === 'code' || lg.phase === 'password') {
-      html += `<div class="row" style="margin-top:10px"><label>${lg.message}</label>
-        <input type="text" id="val" placeholder="输入后回车"></div>`;
-    } else if (lg.phase === 'done') {
-      html += `<div class="hint" style="margin-top:10px;color:#1a9e5f">${lg.message}</div>`;
-    } else if (lg.phase === 'failed') {
-      html += `<div class="err" style="margin-top:10px">${lg.message}</div>`;
-    }
-    if (lg.phase === 'idle' || lg.phase === 'done' || lg.phase === 'failed') {
-      html += `<div class="row" style="margin-top:10px"><label>手机号</label>
-        <input type="text" id="phone" placeholder="+8613800000000"></div>
-        <div class="row"><label></label><button class="pri" id="send">发送验证码</button></div>`;
-    }
-    html += `<div class="hint" id="lmsg" style="margin-top:6px"></div>`;
-    body.innerHTML = html;
-
-    const send = body.querySelector('#send');
-    if (send) {
-      send.addEventListener('click', async () => {
-        const phone = body.querySelector('#phone').value.trim();
-        if (!phone) return;
-        send.disabled = true;
-        try {
-          await api('/api/login', { phone });
-          await refreshState();
-        } catch (e) {
-          body.querySelector('#lmsg').innerHTML = `<span class="err">${e.message || e}</span>`;
-          send.disabled = false;
-        }
-      });
-    }
-    const val = body.querySelector('#val');
-    if (val) {
-      val.focus();
-      val.addEventListener('keydown', async (e) => {
-        if (e.key !== 'Enter') return;
-        try {
-          await api('/api/login', { value: val.value.trim() });
-          await refreshState();
-        } catch (err) {
-          body.querySelector('#lmsg').innerHTML = `<span class="err">${err.message || err}</span>`;
-        }
-      });
-    }
-  }
-
   // ======================= 启动 =======================
   function boot() {
     injectChipStyle();
@@ -456,9 +471,12 @@
       shadow.querySelector('.panel').insertBefore(tip, shadow.querySelector('.tabs'));
     }
     refreshState();
-    stateTimer = setInterval(() => {
-      if (panel.style.display !== 'none') refreshState();
-    }, 1500);
+    const poll = async () => {
+      if (panel.style.display !== 'none') await refreshState();
+      const busy = lastState && lastState.tasks.some((t) => t.active);
+      stateTimer = setTimeout(poll, busy ? 700 : 3000);
+    };
+    stateTimer = setTimeout(poll, 0);
 
     let scheduled = false;
     const schedule = () => {

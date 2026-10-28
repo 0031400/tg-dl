@@ -443,6 +443,8 @@ async def download_location(
     auth_keys: int = 1,
     key_store: "AuthKeyStore | None" = None,
     extra_clients: list | None = None,
+    resume_offsets: set[int] | None = None,
+    on_chunk: Callable[[int, int], None] | None = None,
     on_progress: ProgressCb | None = None,
 ) -> Path:
     """并行下载一个文件。
@@ -458,14 +460,25 @@ async def download_location(
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    with dest.open("wb") as fp:
-        fp.truncate(size)  # 预分配，避免边下边扩导致碎片
+    # 断点续传：文件大小对得上就保留已有数据，只补没下过的分片
+    done_offsets: set[int] = set(resume_offsets or ())
+    if done_offsets and (not dest.exists() or dest.stat().st_size != size):
+        done_offsets = set()  # 文件被删过或大小不对，重头来
+    if done_offsets:
+        with dest.open("r+b") as fp:
+            fp.truncate(size)
+    else:
+        with dest.open("wb") as fp:
+            fp.truncate(size)  # 预分配，避免边下边扩导致碎片
 
     queue: asyncio.Queue[int] = asyncio.Queue()
     for offset in range(0, size, chunk):
-        queue.put_nowait(offset)
+        if offset not in done_offsets:
+            queue.put_nowait(offset)
 
-    state = {"done": 0, "cdn": True}
+    # 已下载部分要算进进度，否则最后的截断逻辑会把文件截短
+    resumed_bytes = sum(min(chunk, size - off) for off in done_offsets)
+    state = {"done": resumed_bytes, "cdn": True}
     lock = asyncio.Lock()
     limiter = AdaptiveLimiter(connections, adaptive=adaptive)
     started = time.monotonic()
@@ -533,7 +546,7 @@ async def download_location(
                         f"（累计 {limiter.floods} 次）"
                     )
                     last = exc
-                except (errors.RpcError, OSError) as exc:
+                except (errors.RPCError, OSError) as exc:
                     last = exc
                     await asyncio.sleep(min(2 ** attempt * 0.5, 8))
             raise FastError(f"offset {offset} 重试 {retries} 次仍失败: {last}")
@@ -562,6 +575,8 @@ async def download_location(
                         if not written:
                             raise FastError(f"写盘失败 offset={offset}")
                         view = view[written:]
+                    if on_chunk is not None:
+                        on_chunk(offset, len(data))
                     async with lock:
                         state["done"] += len(data)
                         if on_progress:
@@ -741,6 +756,9 @@ async def download_message(
     adaptive: bool = True,
     sessions: int = 1,
     auth_keys: int = 1,
+    resume_offsets: set[int] | None = None,
+    on_chunk: Callable[[int, int], None] | None = None,
+    on_info: Callable[[str, int], None] | None = None,
     on_progress: ProgressCb | None = None,
 ) -> tuple[Path, float, str, int]:
     """按 chat_id:message_id 下载消息里的文件。
@@ -770,6 +788,8 @@ async def download_message(
         size = int(size)
         if limit:
             size = min(size, int(limit))
+        if on_info is not None:
+            on_info(name, size)  # 一拿到消息就告诉调用方，省掉一次单独的 message_info 连接
         target = Path(dest) if dest is not None else Path.cwd()
         if target.is_dir():
             target = target / name
@@ -780,13 +800,15 @@ async def download_message(
                 connections=connections, chunk=chunk,
                 adaptive=adaptive, auth_keys=auth_keys,
                 key_store=AuthKeyStore(cfg.authkeys_file),
-                extra_clients=extra, on_progress=on_progress,
+                extra_clients=extra,
+                resume_offsets=resume_offsets, on_chunk=on_chunk,
+                on_progress=on_progress,
             )
         except errors.FileReferenceExpiredError as exc:
             raise FastError(
                 "file_reference 过期了，重新跑一次（每次都会从消息里取最新的）"
             ) from exc
-        except errors.RpcError as exc:
+        except errors.RPCError as exc:
             raise FastError(f"Telegram 返回错误: {exc}") from exc
         return target, time.monotonic() - started, name, size
     finally:

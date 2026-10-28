@@ -90,7 +90,7 @@ class Task:
     id: str
     chat_id: int
     message_id: int
-    status: str = "queued"        # queued | running | done | failed | cancelled
+    status: str = "queued"        # queued | running | stopping | stopped | done | failed
     name: str = ""
     size: int = 0
     done: int = 0
@@ -99,10 +99,13 @@ class Task:
     path: str = ""
     created: float = field(default_factory=time.time)
     updated: float = field(default_factory=time.time)
+    offsets: set[int] = field(default_factory=set, repr=False)  # 已完成分片，用于续传
 
     def to_dict(self) -> dict[str, Any]:
-        d = asdict(self)
+        d = {k: v for k, v in asdict(self).items() if k != "offsets"}
         d["target"] = f"{self.chat_id}:{self.message_id}"
+        d["resumable"] = bool(self.offsets) and self.status in ("stopped", "failed")
+        d["active"] = self.status in ("queued", "running", "stopping")
         return d
 
 
@@ -115,6 +118,7 @@ class TaskManager:
         self._order: list[str] = []
         self._lock = threading.Lock()
         self._queue: queue.Queue[str] = queue.Queue()
+        self._running: dict[str, tuple[Any, Any]] = {}   # id -> (loop, asyncio.Task)
         self._worker = threading.Thread(target=self._loop, daemon=True)
         self._worker.start()
 
@@ -128,26 +132,50 @@ class TaskManager:
         return task
 
     def cancel(self, task_id: str) -> bool:
+        """停止：真取消协程，保留已下载的分片以便续传。"""
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None or task.status in ("done", "failed", "cancelled"):
+            if task is None or task.status not in ("queued", "running"):
                 return False
-            task.status = "cancelled"
+            task.status = "stopping"
             task.updated = time.time()
+        running = self._running.get(task_id)
+        if running is not None:
+            loop, atask = running
+            try:
+                loop.call_soon_threadsafe(atask.cancel)
+            except RuntimeError:
+                pass
+        else:
+            self._update(task_id, status="stopped")  # 还在队列里，没开始
+        return True
+
+    def resume(self, task_id: str) -> bool:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status not in ("stopped", "failed"):
+                return False
+            task.status = "queued"
+            task.error = ""
+            task.updated = time.time()
+        self._queue.put(task_id)
+        return True
+
+    def remove(self, task_id: str) -> bool:
+        self.cancel(task_id)
+        with self._lock:
+            if self._tasks.pop(task_id, None) is None:
+                return False
+            if task_id in self._order:
+                self._order.remove(task_id)
             return True
 
     def clear(self) -> int:
         with self._lock:
-            keep = []
-            removed = 0
-            for tid in self._order:
-                if self._tasks[tid].status in ("done", "failed", "cancelled"):
-                    del self._tasks[tid]
-                    removed += 1
-                else:
-                    keep.append(tid)
-            self._order = keep
-            return removed
+            ids = [t for t in self._order if self._tasks[t].status in ("done", "failed", "stopped")]
+        for tid in ids:
+            self.remove(tid)
+        return len(ids)
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -171,55 +199,77 @@ class TaskManager:
         while True:
             task_id = self._queue.get()
             task = self._get(task_id)
-            if task is None or task.status == "cancelled":
+            if task is None or task.status not in ("queued",):
                 continue
             self._run(task)
 
     def _run(self, task: Task) -> None:
+        import asyncio
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        atask = loop.create_task(self._download(task))
+        self._running[task.id] = (loop, atask)
+        try:
+            loop.run_until_complete(atask)
+        except asyncio.CancelledError:
+            self._update(task.id, status="stopped", speed=0.0)
+        except Exception as exc:  # noqa: BLE001
+            # 用户点了「停止」后连接被掐断会抛各种异常，这些不算失败
+            if self._get(task.id) is not None and self._get(task.id).status == "stopping":
+                self._update(task.id, status="stopped", error="", speed=0.0)
+            else:
+                self._update(task.id, status="failed", error=str(exc), speed=0.0)
+        finally:
+            self._running.pop(task.id, None)
+            try:
+                loop.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _download(self, task: Task) -> None:
         st = _load_settings(self.cfg)
         out_dir = Path(st.download_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        last = [0.0, time.time()]
+        self._update(task.id, status="running")
+
+        def on_info(name: str, size: int) -> None:
+            self._update(task.id, name=name, size=size)
+
+        # 速度用 2 秒左右的指数滑动平均，单次采样的抖动太难看
+        last = [0.0, time.time(), 0.0]
 
         def on_progress(done: int, total: int) -> None:
             now = time.time()
-            if now - last[1] >= 0.5:
-                speed = (done - last[0]) / (now - last[1])
-                last[0], last[1] = done, now
-                self._update(task.id, done=done, size=total, speed=speed)
+            if now - last[1] < 0.4:
+                return
+            inst = (done - last[0]) / max(now - last[1], 1e-6)
+            last[2] = inst if last[2] == 0 else last[2] * 0.6 + inst * 0.4
+            last[0], last[1] = done, now
+            self._update(task.id, done=done, size=total, speed=last[2])
 
-        self._update(task.id, status="running")
+        def on_chunk(offset: int, _length: int) -> None:
+            task.offsets.add(offset)
 
-        # 先把文件名/大小拿到，列表里好看一点
-        try:
-            info = asyncio_run(
-                fast.message_info(self.cfg, task.chat_id, task.message_id)
-            )
-            self._update(task.id, name=info["name"], size=int(info["size"]))
-        except Exception:  # noqa: BLE001
-            pass
-
-        try:
-            path, _elapsed, name, size = asyncio_run(
-                fast.download_message(
-                    self.cfg,
-                    task.chat_id,
-                    task.message_id,
-                    out_dir,
-                    connections=st.connections,
-                    chunk=parse_size_safe(st.chunk),
-                    adaptive=not st.fixed,
-                    auth_keys=st.auth_keys,
-                    on_progress=on_progress,
-                )
-            )
-            self._update(
-                task.id, status="done", path=str(path), name=name,
-                size=size, done=size, speed=0.0,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._update(task.id, status="failed", error=str(exc), speed=0.0)
+        path, _elapsed, name, size = await fast.download_message(
+            self.cfg,
+            task.chat_id,
+            task.message_id,
+            out_dir,
+            connections=st.connections,
+            chunk=parse_size_safe(st.chunk),
+            adaptive=not st.fixed,
+            auth_keys=st.auth_keys,
+            resume_offsets=set(task.offsets) or None,
+            on_chunk=on_chunk,
+            on_info=on_info,
+            on_progress=on_progress,
+        )
+        self._update(
+            task.id, status="done", path=str(path), name=name,
+            size=size, done=size, speed=0.0,
+        )
 
 
 def asyncio_run(coro):
@@ -301,22 +351,60 @@ class LoginBridge:
 # --------------------------------------------------------------------------- #
 
 class App:
+    # 账号信息缓存多久（秒）。之前每次 /api/state 都新建一条 Telethon 连接，
+    # 面板 1.5 秒轮询一次 → 网络不好时会疯狂重连并刷 TimeoutError。
+    ACCOUNT_TTL = 30.0
+
     def __init__(self, cfg: Config, token: str):
         self.cfg = cfg
         self.token = token
         self.tasks = TaskManager(cfg)
         self.login = LoginBridge()
+        self._account: dict[str, Any] = {
+            "fast": None, "auth_keys_cached": 0, "checked": 0.0, "error": "",
+        }
+        self._account_lock = threading.Lock()
+        self._refreshing = False
+
+    # ---- 账号信息：后台刷新，绝不阻塞 HTTP ----
+    def _account_snapshot(self) -> dict[str, Any]:
+        with self._account_lock:
+            snap = dict(self._account)
+        snap["auth_keys_cached"] = self._count_keys()
+        snap["age"] = round(time.time() - snap.get("checked", 0), 1) if snap.get("checked") else None
+        return snap
+
+    def _count_keys(self) -> int:
+        try:
+            return fast.AuthKeyStore(self.cfg.authkeys_file).count()
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def refresh_account(self, *, force: bool = False) -> None:
+        """在后台线程里更新账号信息；已经足够新或正在刷新就跳过。"""
+        with self._account_lock:
+            fresh = time.time() - self._account.get("checked", 0) < self.ACCOUNT_TTL
+            if self._refreshing or (fresh and not force):
+                return
+            self._refreshing = True
+
+        def work() -> None:
+            try:
+                user = asyncio_run(fast.whoami(self.cfg))
+                with self._account_lock:
+                    self._account.update(fast=user, error="", checked=time.time())
+            except Exception as exc:  # noqa: BLE001
+                with self._account_lock:
+                    self._account.update(error=str(exc), checked=time.time())
+            finally:
+                with self._account_lock:
+                    self._refreshing = False
+
+        threading.Thread(target=work, daemon=True).start()
 
     def state(self) -> dict[str, Any]:
         cfg = self.cfg
-        try:
-            fast_user = asyncio_run(fast.whoami(cfg))
-        except Exception:  # noqa: BLE001
-            fast_user = None
-        try:
-            cached_keys = fast.AuthKeyStore(cfg.authkeys_file).count()
-        except Exception:  # noqa: BLE001
-            cached_keys = 0
+        self.refresh_account()
         return {
             "version": VERSION,
             "config": {
@@ -326,7 +414,7 @@ class App:
             },
             "settings": _load_settings(cfg).to_dict(),
             "login": self.login.snapshot(),
-            "account": {"fast": fast_user, "auth_keys_cached": cached_keys},
+            "account": self._account_snapshot(),
             "tasks": self.tasks.list(),
         }
 
@@ -405,6 +493,11 @@ def make_handler(app: App):
                 return
             body = self._body()
 
+            if path == "/api/account/refresh":
+                app.refresh_account(force=True)
+                self._send({"ok": True, "account": app._account_snapshot()})
+                return
+
             if path == "/api/settings":
                 st = _load_settings(app.cfg)
                 if isinstance(body.get("connections"), int) and body["connections"] > 0:
@@ -472,6 +565,16 @@ def make_handler(app: App):
                 self._send({"ok": ok})
                 return
 
+            if path == "/api/tasks/resume":
+                ok = app.tasks.resume(str(body.get("id") or ""))
+                self._send({"ok": ok})
+                return
+
+            if path == "/api/tasks/remove":
+                ok = app.tasks.remove(str(body.get("id") or ""))
+                self._send({"ok": ok})
+                return
+
             if path == "/api/tasks/clear":
                 self._send({"ok": True, "removed": app.tasks.clear()})
                 return
@@ -479,6 +582,16 @@ def make_handler(app: App):
             self._send({"error": "not found"}, 404)
 
     return Handler
+
+
+def _already_running(host: str, port: int) -> bool:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/api/ping", timeout=1.5) as resp:
+            return resp.status == 200
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def serve(cfg: Config, *, host: str = "127.0.0.1", port: int = 8765,
@@ -493,8 +606,20 @@ def serve(cfg: Config, *, host: str = "127.0.0.1", port: int = 8765,
             token = secrets.token_urlsafe(18)
             token_file.write_text(token + "\n", encoding="utf-8")
 
+    # Windows 上 allow_reuse_address=True 会让两个进程同时绑同一端口（请求被老进程吃掉），
+    # 这里显式关掉，并且在绑定前先探一下有没有已经在跑的服务。
+    class _Server(ThreadingHTTPServer):
+        allow_reuse_address = False
+        daemon_threads = True
+
+    if _already_running(host, port):
+        raise OSError(
+            f"{host}:{port} 上已经有一个 tgdl serve 在跑；"
+            "先关掉它（或换 --port）再启动。"
+        )
+
     app = App(cfg, token)
-    httpd = ThreadingHTTPServer((host, port), make_handler(app))
+    httpd = _Server((host, port), make_handler(app))
     print(f"tgdl 本地服务已启动: http://{host}:{port}")
     print(f"token: {token}")
     print(f"（也写在 {token_file}）")

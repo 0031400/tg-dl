@@ -36,6 +36,20 @@ src/tgdl/server.py              ← 本地服务（tgdl serve）
 
 5. 「下载」标签里看进度；文件落在设置里的「下载目录」（默认 `.tgdl/downloads`）。
 
+## 任务操作
+
+每条任务下面三个按钮，按状态自动切换：
+
+| 状态 | 显示 |
+| --- | --- |
+| 排队中 / 下载中 | 停止、删除 |
+| 已停止 / 失败 | 继续、删除 |
+| 已完成 | 删除 |
+
+**停止**是真取消（协程被 cancel，连接立刻断），已下完的分片会记下来；
+**继续**从断点接着下，不会从头重来（实测停在 98.5 MB，继续时从 98.5 MB 开始）。
+分片记录只在当前服务进程内有效，重启服务后「继续」等于重下。
+
 ## 设置项
 
 | 项 | 含义 |
@@ -56,11 +70,14 @@ src/tgdl/server.py              ← 本地服务（tgdl serve）
 | GET | `/api/ping` | 健康检查 |
 | GET | `/api/state` | 配置 + 设置 + 任务 + 登录状态 |
 | POST | `/api/settings` | 改设置 |
-| POST | `/api/login` | 登录（`{phone}` → `{value}` 验证码 → `{value}` 两步密码） |
+| POST | `/api/login` | 登录（`{phone}` → `{value}` 验证码 → `{value}` 两步密码）。**面板已不再提供入口**，用 `tgdl login` 或直接调接口 |
 | POST | `/api/resolve` | `{username}` → `{chat_id}`，用于 `#@username` 形式的会话 |
 | POST | `/api/tasks` | `{target: "chat:mid"}` 新建任务 |
-| POST | `/api/tasks/cancel` | `{id}` 取消 |
-| POST | `/api/tasks/clear` | 清掉已完成/失败 |
+| POST | `/api/tasks/cancel` | `{id}` 停止（真取消，保留已下分片） |
+| POST | `/api/tasks/resume` | `{id}` 继续（从断点续传） |
+| POST | `/api/tasks/remove` | `{id}` 删除任务 |
+| POST | `/api/tasks/clear` | 清掉已完成/停止/失败 |
+| POST | `/api/account/refresh` | 强制刷新账号状态（连不上 Telegram 时这里会报错） |
 
 ## 已知限制
 
