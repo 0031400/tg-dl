@@ -1,8 +1,8 @@
 """给 TDLib 源码打"提速补丁"：放宽下载并发上限，然后需要你自己重编 tdjson。
 
 用法：
-    uv run python scripts/patch_tdlib.py --td-src D:/file/cpp/td-1.8.0
-    uv run python scripts/patch_tdlib.py --td-src D:/file/cpp/td-1.8.0 --revert
+    uv run python scripts/patch_tdlib.py --td-src C:/Users/Administrator/file/td-1.8.0
+    uv run python scripts/patch_tdlib.py --td-src C:/Users/Administrator/file/td-1.8.0 --revert
 
 改动只有两处（详见 README「想让 TDLib 自己也变快？」）：
     1. td/telegram/files/ResourceManager.h  MAX_RESOURCE_LIMIT 2MiB -> 64MiB
@@ -56,7 +56,7 @@ def apply(td_src: Path, revert: bool) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--td-src", default=r"D:\file\cpp\td-1.8.0", help="TDLib 源码根目录")
+    parser.add_argument("--td-src", default=r"C:\Users\Administrator\file\td-1.8.0", help="TDLib 源码根目录")
     parser.add_argument("--revert", action="store_true", help="撤销改动")
     args = parser.parse_args()
 

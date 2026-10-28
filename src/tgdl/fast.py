@@ -221,19 +221,31 @@ async def probe_size(client, location, *, dc_id: int | None = None,
 # --------------------------------------------------------------------------- #
 
 class AdaptiveLimiter:
-    """在途请求数的自适应闸门。
+    """在途请求数的闸门。
 
-    Telegram 的 flood 限制是按**账号**算的，撞上以后如果还保持原来的并发猛发，
-    就会陷入「限流 → 睡 → 突发 → 再限流」。这里做两件事：
+    默认是**自适应**的（同 TDLib 的 ResourceManager）：
 
     1. 撞到 FLOOD_WAIT 就把在途额度砍半，并记一个全局冷却时间点，
        所有 worker 在这之前都不再发请求（避免睡醒后集体突发）；
-    2. 连续成功若干次后，额度慢慢涨回上限（不超过调用方给的最大值）。
+    2. 连续成功若干次后，额度慢慢涨回上限。
+
+    ``adaptive=False`` 时并发**钉死在给定值**：撞限流只做全局冷却、不降额度，
+    也不会自动涨回去。想复现固定并发、或想确认某个值到底稳不稳时用这个。
     """
 
-    def __init__(self, limit: int, *, grow_after: int = 16, start: int | None = None):
+    def __init__(
+        self,
+        limit: int,
+        *,
+        grow_after: int = 16,
+        start: int | None = None,
+        adaptive: bool = True,
+    ):
         self.max_limit = max(1, limit)
-        # 直接从上限起步；一旦撞限流就砍半，稳定后再慢慢涨回来（同 TDLib 的 ResourceManager）
+        # 砍半时留个地板，别一路掉到 1（掉下去再爬回来太慢，实测反而更慢）
+        self.min_limit = max(1, self.max_limit // 4)
+        self.adaptive = adaptive
+        # 自适应模式直接从上限起步；固定模式当然就用给定的值
         self.limit = max(1, min(start if start is not None else self.max_limit, self.max_limit))
         self.active = 0
         self.flood_until = 0.0
@@ -254,19 +266,23 @@ class AdaptiveLimiter:
             self._cond.notify()
 
     def note_success(self) -> None:
+        if not self.adaptive:
+            return
         self._ok_streak += 1
         if self._ok_streak >= self._grow_after and self.limit < self.max_limit:
             self._ok_streak = 0
             self.limit = min(self.max_limit, self.limit + 1)
 
     async def note_flood(self, seconds: int) -> int:
-        """记录一次限流，返回砍半后的新额度。"""
+        """记录一次限流，返回当前的额度（自适应模式下是砍半后的值）。"""
         self._ok_streak = 0
         self.floods += 1
         self.flood_until = max(self.flood_until, time.monotonic() + seconds + 0.5)
+        if not self.adaptive:
+            return self.limit
         async with self._cond:
             old = self.limit
-            self.limit = max(1, self.limit // 2)
+            self.limit = max(self.min_limit, self.limit // 2)
             if self.limit != old:
                 self._cond.notify_all()
             return self.limit
@@ -291,6 +307,7 @@ async def download_location(
     connections: int = 16,
     chunk: int = DEFAULT_CHUNK,
     retries: int = 6,
+    adaptive: bool = True,
     on_progress: ProgressCb | None = None,
 ) -> Path:
     _, errors, functions, types = _telethon()
@@ -309,7 +326,7 @@ async def download_location(
 
     state = {"done": 0, "cdn": True}
     lock = asyncio.Lock()
-    limiter = AdaptiveLimiter(connections)
+    limiter = AdaptiveLimiter(connections, adaptive=adaptive)
     started = time.monotonic()
 
     async with _sender_for(client, dc_id) as sender:
@@ -339,8 +356,12 @@ async def download_location(
                 except errors.FloodWaitError as exc:
                     wait = int(getattr(exc, "seconds", 1))
                     new_limit = await limiter.note_flood(wait)
+                    if limiter.adaptive:
+                        detail = f"在途并发降到 {new_limit}"
+                    else:
+                        detail = f"保持并发 {new_limit}（固定模式）"
                     print(
-                        f"[fast] FLOOD_WAIT {wait}s，在途并发降到 {new_limit}"
+                        f"[fast] FLOOD_WAIT {wait}s，{detail}"
                         f"（累计 {limiter.floods} 次）"
                     )
                     last = exc
@@ -396,10 +417,12 @@ async def download_location(
 
     elapsed = time.monotonic() - started
     if limiter.floods:
-        print(
-            f"[fast] 本次共遇到 {limiter.floods} 次 FLOOD_WAIT，"
+        tail = (
             f"并发已自适应到 {limiter.limit}（上限 {limiter.max_limit}）"
+            if limiter.adaptive
+            else f"并发固定为 {limiter.limit}"
         )
+        print(f"[fast] 本次共遇到 {limiter.floods} 次 FLOOD_WAIT，{tail}")
     if state["done"] < size:
         # 探测的大小可能偏大，按实际写入量截断
         os.truncate(dest, state["done"])
@@ -526,6 +549,7 @@ async def download_message(
     connections: int = 16,
     chunk: int = DEFAULT_CHUNK,
     limit: int = 0,
+    adaptive: bool = True,
     on_progress: ProgressCb | None = None,
 ) -> tuple[Path, float, str, int]:
     """按 chat_id:message_id 下载消息里的文件。
@@ -551,7 +575,8 @@ async def download_message(
         try:
             await download_location(
                 client, location, size, target, dc_id=dc_id,
-                connections=connections, chunk=chunk, on_progress=on_progress,
+                connections=connections, chunk=chunk,
+                adaptive=adaptive, on_progress=on_progress,
             )
         except errors.FileReferenceExpiredError as exc:
             raise FastError(

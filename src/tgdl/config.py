@@ -7,7 +7,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_TDJSON = Path(r"D:\file\cpp\lib\tdlib\bin\tdjson.dll")
+DEFAULT_TDJSON = Path(r"C:\Users\Administrator\file\tdlib\bin\tdjson.dll")
 
 
 class ConfigError(RuntimeError):

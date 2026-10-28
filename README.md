@@ -12,7 +12,7 @@ Telegram 文件下载器。输入只有一种格式：**`chat_id:message_id`**�
 ## 快速开始
 
 ```bash
-cd D:/file/python/tg-dl
+cd C:/Users/Administrator/file/tg-dl
 uv sync
 
 # 1. 写配置（api_id / api_hash 从 https://my.telegram.org 申请）
@@ -26,7 +26,7 @@ uv run tgdl info 8913476869:6733
 
 # 4. 下载
 uv run tgdl download 8913476869:6733 -o out.mp4
-uv run tgdl download -1001234567890:42 -o D:/downloads/     # 给已存在的目录就用原文件名
+uv run tgdl download -1001234567890:42 -o C:/Users/Administrator/file/downloads/     # 给已存在的目录就用原文件名
 
 # 5. 同一个文件实测两边速度
 uv run tgdl bench 8913476869:6733 -c 4,8,16,32
@@ -35,7 +35,7 @@ uv run tgdl bench 8913476869:6733 -c 4,8,16,32
 uv run tgdl logout
 ```
 
-`tdjson` 路径默认 `D:\file\cpp\lib\tdlib\bin\tdjson.dll`（可用 `--tdjson` 或环境变量 `TGDL_TDJSON` 覆盖）。
+`tdjson` 路径默认 `C:\Users\Administrator\file\tdlib\bin\tdjson.dll`（可用 `--tdjson` 或环境变量 `TGDL_TDJSON` 覆盖）。
 配置查找顺序：`--config` → `$TGDL_CONFIG` → `./.tgdl/config.toml` → `~/.tgdl/config.toml`。
 
 ## 输入格式
@@ -58,7 +58,7 @@ chat_id:message_id
 
 ## 为什么 fast 能比 TDLib 快
 
-不是玄学，是 TDLib 自己给自己设了上限（源码 `D:\file\cpp\td-1.8.0`）：
+不是玄学，是 TDLib 自己给自己设了上限（源码 `C:\Users\Administrator\file\td-1.8.0`）：
 
 1. **全局在途预算只有 2 MiB**
    `td/telegram/files/ResourceManager.h` → `MAX_RESOURCE_LIMIT = 1 << 21`，
@@ -98,9 +98,19 @@ Telegram 的 flood 限制按**账号**算。如果撞上以后还保持原并发
 
 `fast` 引擎里有一个 `AdaptiveLimiter`（同 TDLib 的 `ResourceManager` 思路）：
 
-- 撞到限流 → 在途额度**砍半**，并记一个**全局冷却时间点**，所有 worker 在这之前都不再发请求
-  （避免睡醒后集体突发）；
+- 撞到限流 → 在途额度**砍半**（有地板，最低 `-c/4`），并记一个**全局冷却时间点**，
+  所有 worker 在这之前都不再发请求（避免睡醒后集体突发）；
 - 连续成功 → 额度慢慢涨回 `-c` 给的上限。
+
+想让并发**钉死**在一个值、完全不做调节，加 `--fixed`：撞限流只做全局冷却，不降额度也不涨。
+同一个 189 MB 文件实测（`-c 16`）：
+
+| 模式 | 耗时 | 速度 |
+| --- | --- | --- |
+| 自适应 + 地板（默认） | **41.5s** | **4.57 MiB/s** |
+| `--fixed -c 16` | 44.9s | 4.21 MiB/s |
+| `--engine tdlib` | 46.1s | 4.11 MiB/s |
+| 自适应但无地板（旧） | 49.5s | 3.83 MiB/s |
 
 实测 96 MB：改之前 32 MB 就能触发 56 次（累计等 112 秒）；改之后 96 MB 只有 4 次、每次 1 秒，
 并发自动从 16 降到 1 再涨回 9，下载全程没有卡顿。所以偶尔看到一两条 `FLOOD_WAIT` 是正常的
@@ -138,7 +148,7 @@ Telethon 的 AES-IGE 加解密有三档实现：`cryptg`（C 扩展）→ `libss
 | `tgdl logout` | 退出登录并清理会话 |
 | `tgdl whoami` | 两个引擎的登录状态 |
 | `tgdl info <chat_id:message_id>` | 看文件名 / 大小 / 类型 / DC，不下载 |
-| `tgdl download <chat_id:message_id> [-o 路径] [-c 16] [--chunk 512K] [--engine auto\|fast\|tdlib]` | 下载 |
+| `tgdl download <chat_id:message_id> [-o 路径] [-c 16] [--chunk 512K] [--fixed] [--engine auto\|fast\|tdlib]` | 下载 |
 | `tgdl bench <chat_id:message_id> [-c 4,8,16,32] [--mb 64]` | 同文件对比两个引擎（`--mb` 只测前 N MB） |
 | `tgdl doctor` | 自检配置 / dll / 会话 |
 
@@ -158,8 +168,8 @@ Telethon 的 AES-IGE 加解密有三档实现：`cryptg`（C 扩展）→ `libss
 如果必须留在 TDLib 内部（比如要复用它已有的会话），可以改源码后重编。仓库里带了脚本：
 
 ```bash
-uv run python scripts/patch_tdlib.py --td-src D:/file/cpp/td-1.8.0          # 打补丁（自动备份 .bak）
-uv run python scripts/patch_tdlib.py --td-src D:/file/cpp/td-1.8.0 --revert # 撤销
+uv run python scripts/patch_tdlib.py --td-src C:/Users/Administrator/file/td-1.8.0          # 打补丁（自动备份 .bak）
+uv run python scripts/patch_tdlib.py --td-src C:/Users/Administrator/file/td-1.8.0 --revert # 撤销
 ```
 
 它只改两处：`ResourceManager.h` 的 `MAX_RESOURCE_LIMIT`（2 MiB → 64 MiB）、

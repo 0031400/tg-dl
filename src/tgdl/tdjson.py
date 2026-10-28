@@ -405,23 +405,41 @@ class Tdlib:
     def get_message(self, chat_id: int, message_id: int, timeout: float = 60.0) -> Update:
         """按 chat_id:message_id 取消息。
 
-        TDLib 的 ``getMessage`` 只查本地库，本地没有就直接 404，不会回源；
-        所以本地查不到时用 ``getChatHistory`` 从服务端拉这一条。
+        两个坑都要绕：
+        1. TDLib 刚启动（或刚登录）时 chat 库还没加载完，会报 "Chat not found"，
+           过一两秒就好 —— 所以这里退避重试，而不是直接失败；
+        2. ``getMessage`` 只查本地库，本地没有就直接 404，不会回源 ——
+           所以查不到时用 ``getChatHistory`` 从服务端拉这一条。
         """
         message_id = to_tdlib_message_id(int(message_id))
         request = {"@type": "getMessage", "chat_id": int(chat_id), "message_id": message_id}
-        try:
-            return self.call(request, timeout=timeout)
-        except TdlibError as exc:
-            if "chat not found" in exc.message.lower():
+        deadline = time.monotonic() + 15.0
+        last: TdlibError | None = None
+
+        while True:
+            try:
+                return self.call(request, timeout=timeout)
+            except TdlibError as exc:
+                last = exc
+                if "chat not found" not in exc.message.lower():
+                    if not _is_not_found(exc):
+                        raise
+                    break  # 消息级 404，交给下面的回源
+                # chat 还没加载：试着建出来，然后等一会儿再问
                 try:
                     self._create_chat(chat_id)
-                    return self.call(request, timeout=timeout)
-                except TdlibError as retry_exc:
-                    exc = retry_exc
-            if not _is_not_found(exc):
-                raise
-        return self._fetch_message_remote(chat_id, message_id, timeout)
+                except TdlibError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.5)
+
+        try:
+            return self._fetch_message_remote(chat_id, message_id, timeout)
+        except TdlibError:
+            if last is not None:
+                raise last
+            raise
 
     def _fetch_message_remote(self, chat_id: int, message_id: int, timeout: float) -> Update:
         result = self.call(

@@ -264,6 +264,10 @@ def download(
         help="fast 引擎并发在途请求数（同一条 TCP 上多路复用，不是 TCP 连接数）",
     ),
     chunk: str = typer.Option("512K", "--chunk", help="fast 引擎分片大小（最大 1M）"),
+    fixed: bool = typer.Option(
+        False, "--fixed",
+        help="固定并发，不做自适应调节（撞限流只等待、不降并发）",
+    ),
     verbosity: int = typer.Option(1, "--verbosity"),
 ) -> None:
     """下载 chat_id:message_id 指向的消息里的文件。"""
@@ -291,7 +295,7 @@ def download(
                     fast.download_message(
                         cfg, chat_id, message_id, output,
                         connections=connections, chunk=chunk_bytes,
-                        on_progress=bar.update,
+                        adaptive=not fixed, on_progress=bar.update,
                     )
                 )
         except fast.FastError as exc:
