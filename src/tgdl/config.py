@@ -21,6 +21,9 @@ class Config:
     tdjson: Path = field(default=DEFAULT_TDJSON)
     data_dir: Path = field(default=Path(".tgdl"))
     config_path: Path | None = None
+    # 会话所在 DC（登录后记录），以及上次下载用的 DC（连接池预热用）
+    session_dc: int | None = None
+    pool_dc: int | None = None
 
     # ---- 派生路径 ----
     @property
@@ -117,6 +120,10 @@ def _from_toml(path: Path) -> Config:
     if raw.get("tdjson"):
         p = Path(str(raw["tdjson"]))
         cfg.tdjson = p if p.is_absolute() else (base / p).resolve()
+    if raw.get("session_dc"):
+        cfg.session_dc = int(raw["session_dc"])
+    if raw.get("pool_dc"):
+        cfg.pool_dc = int(raw["pool_dc"])
     if raw.get("data_dir"):
         p = Path(str(raw["data_dir"]))
         cfg.data_dir = p if p.is_absolute() else (base / p).resolve()
@@ -126,7 +133,8 @@ def _from_toml(path: Path) -> Config:
 
 
 def write_config(path: Path, *, api_id: int | None, api_hash: str | None,
-                 tdjson: Path | None, data_dir: Path | None) -> None:
+                 tdjson: Path | None, data_dir: Path | None,
+                 session_dc: int | None = None, pool_dc: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["# tgdl 配置", ""]
     if api_id:
@@ -137,4 +145,156 @@ def write_config(path: Path, *, api_id: int | None, api_hash: str | None,
         lines.append(f'tdjson = {str(tdjson).replace(chr(92), "/")!r}')
     if data_dir:
         lines.append(f'data_dir = {str(data_dir).replace(chr(92), "/")!r}')
+    if session_dc:
+        lines.append(f"session_dc = {int(session_dc)}")
+    if pool_dc:
+        lines.append(f"pool_dc = {int(pool_dc)}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def remember_dc(cfg: Config, *, session_dc: int | None = None,
+                pool_dc: int | None = None) -> None:
+    """把 DC 写回 config.toml（值没变就不写，避免每次运行都碰磁盘）。
+
+    只改这两行，文件里的注释和其它键都原样保留。
+    """
+    path = cfg.config_path
+    if path is None:
+        return
+    updates: dict[str, int] = {}
+    if session_dc is not None and session_dc != cfg.session_dc:
+        cfg.session_dc = int(session_dc)
+        updates["session_dc"] = int(session_dc)
+    if pool_dc is not None and pool_dc != cfg.pool_dc:
+        cfg.pool_dc = int(pool_dc)
+        updates["pool_dc"] = int(pool_dc)
+    if not updates:
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = ["# tgdl 配置", ""]
+    for key, value in updates.items():
+        for i, line in enumerate(lines):
+            if line.strip().startswith(f"{key} "):
+                lines[i] = f"{key} = {value}"
+                break
+        else:
+            lines.append(f"{key} = {value}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _search_paths(explicit: Path | None) -> list[Path]:
+    if explicit is not None:
+        return [explicit]
+    candidates: list[Path] = []
+    env = os.environ.get("TGDL_CONFIG")
+    if env:
+        candidates.append(Path(env))
+    candidates.append(Path.cwd() / ".tgdl" / "config.toml")
+    candidates.append(Path.home() / ".tgdl" / "config.toml")
+    return candidates
+
+
+def load_config(explicit: Path | None = None) -> Config:
+    """按 显式路径 -> $TGDL_CONFIG -> ./.tgdl -> ~/.tgdl 的顺序查找配置。"""
+    for path in _search_paths(explicit):
+        if path.is_file():
+            return _from_toml(path)
+    if explicit is not None:
+        raise ConfigError(f"配置文件不存在: {explicit}")
+    return _from_env(Config())
+
+
+def _from_env(cfg: Config) -> Config:
+    api_id = os.environ.get("TGDL_API_ID")
+    api_hash = os.environ.get("TGDL_API_HASH")
+    if api_id:
+        cfg.api_id = int(api_id)
+    if api_hash:
+        cfg.api_hash = api_hash
+    if tdjson := os.environ.get("TGDL_TDJSON"):
+        cfg.tdjson = Path(tdjson)
+    if data_dir := os.environ.get("TGDL_DATA_DIR"):
+        cfg.data_dir = Path(data_dir)
+    return cfg
+
+
+def _from_toml(path: Path) -> Config:
+    with path.open("rb") as fp:
+        raw = tomllib.load(fp)
+
+    base = path.parent
+    cfg = Config(config_path=path)
+    if raw.get("api_id"):
+        cfg.api_id = int(raw["api_id"])
+    if raw.get("api_hash"):
+        cfg.api_hash = str(raw["api_hash"])
+    if raw.get("tdjson"):
+        p = Path(str(raw["tdjson"]))
+        cfg.tdjson = p if p.is_absolute() else (base / p).resolve()
+    if raw.get("session_dc"):
+        cfg.session_dc = int(raw["session_dc"])
+    if raw.get("pool_dc"):
+        cfg.pool_dc = int(raw["pool_dc"])
+    if raw.get("data_dir"):
+        p = Path(str(raw["data_dir"]))
+        cfg.data_dir = p if p.is_absolute() else (base / p).resolve()
+    else:
+        cfg.data_dir = base.resolve()
+    return _from_env(cfg)
+
+
+def write_config(path: Path, *, api_id: int | None, api_hash: str | None,
+                 tdjson: Path | None, data_dir: Path | None,
+                 session_dc: int | None = None, pool_dc: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# tgdl 配置", ""]
+    if api_id:
+        lines.append(f"api_id = {int(api_id)}")
+    if api_hash:
+        lines.append(f'api_hash = "{api_hash}"')
+    if tdjson:
+        lines.append(f'tdjson = {str(tdjson).replace(chr(92), "/")!r}')
+    if data_dir:
+        lines.append(f'data_dir = {str(data_dir).replace(chr(92), "/")!r}')
+    if session_dc:
+        lines.append(f"session_dc = {int(session_dc)}")
+    if pool_dc:
+        lines.append(f"pool_dc = {int(pool_dc)}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def remember_dc(cfg: Config, *, session_dc: int | None = None,
+                pool_dc: int | None = None) -> None:
+    """把 DC 写回 config.toml（值没变就不写，避免每次运行都碰磁盘）。"""
+    path = cfg.config_path
+    if path is None:
+        return
+    changed = False
+    if session_dc is not None and session_dc != cfg.session_dc:
+        cfg.session_dc = int(session_dc)
+        changed = True
+    if pool_dc is not None and pool_dc != cfg.pool_dc:
+        cfg.pool_dc = int(pool_dc)
+        changed = True
+    if not changed:
+        return
+    raw: dict = {}
+    if path.is_file():
+        try:
+            with path.open("rb") as fp:
+                raw = tomllib.load(fp)
+        except Exception:  # noqa: BLE001
+            raw = {}
+    raw["session_dc"] = cfg.session_dc
+    raw["pool_dc"] = cfg.pool_dc
+    write_config(
+        path,
+        api_id=cfg.api_id,
+        api_hash=cfg.api_hash,
+        tdjson=cfg.tdjson,
+        data_dir=cfg.data_dir,
+        session_dc=cfg.session_dc,
+        pool_dc=cfg.pool_dc,
+    )

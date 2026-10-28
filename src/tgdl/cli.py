@@ -275,7 +275,10 @@ def download(
     ),
     auth_keys: int = typer.Option(
         1, "--auth-keys",
-        help="并行使用的独立 auth key 数（>1 会现场生成，绕过按 key 的限流；无需额外登录）",
+        help=(
+            "并行使用的独立 auth key 总数（含主会话）。优先用 .tgdl/authkeys.json 里缓存的，"
+            "不够的部分现场 DH 生成并写回缓存；无需额外登录"
+        ),
     ),
     verbosity: int = typer.Option(1, "--verbosity"),
 ) -> None:
@@ -297,6 +300,11 @@ def download(
             console.print(
                 f"[yellow]提示：{connections} 个在途请求容易触发 FLOOD_WAIT，"
                 "实测 16 左右吞吐最高[/yellow]"
+            )
+        if auth_keys > 8:
+            console.print(
+                f"[yellow]提示：--auth-keys {auth_keys} 收益递减——新建的授权额度更紧，"
+                "实测 3~5 条最稳，超过 8 条反而 flood 更多、更慢[/yellow]"
             )
         try:
             with ProgressBar("fast") as bar:
@@ -445,6 +453,48 @@ def bench(
 # --------------------------------------------------------------------------- #
 
 @app.command()
+def shell(
+    auth_keys: int = typer.Option(
+        3, "--auth-keys", help="连接池里的独立 auth key 总数（含主会话）"
+    ),
+    connections: int = typer.Option(
+        16, "--connections", "-c", help="总在途请求数（所有 key 加起来）"
+    ),
+    chunk: str = typer.Option("512K", "--chunk", help="分片大小（最大 1M）"),
+    fixed: bool = typer.Option(
+        False, "--fixed", help="固定并发，不做自适应（测速建议开，数据更干净）"
+    ),
+    dc: Optional[int] = typer.Option(
+        None, "--dc", help="预先为某个 DC 建池；不填则第一次 dl 时按文件所在 DC 建"
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None, "--dir", "-o", help="下载目录（默认 .tgdl/downloads）"
+    ),
+) -> None:
+    """交互模式：先建好连接池，再反复下载 / 中断 / 删除（测「服务态」速度用）。"""
+    cfg = _load()
+    from .shell import PoolOptions, run as run_shell
+
+    if auth_keys > 8:
+        console.print(
+            f"[yellow]提示：--auth-keys {auth_keys} 收益递减，实测 3~5 条最稳[/yellow]"
+        )
+    out_dir = output_dir or (cfg.data_dir / "downloads")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    opts = PoolOptions(
+        auth_keys=auth_keys,
+        connections=connections,
+        chunk=parse_size(chunk),
+        adaptive=not fixed,
+        dc_id=dc,
+    )
+    try:
+        _run(run_shell(cfg, opts, out_dir))
+    except KeyboardInterrupt:
+        console.print("[dim]已退出[/dim]")
+
+
+@app.command()
 def doctor(verbosity: int = typer.Option(1, "--verbosity")) -> None:
     """自检：配置、tdjson、会话状态。"""
     table = Table(box=box.SIMPLE, show_header=False)
@@ -477,13 +527,17 @@ def doctor(verbosity: int = typer.Option(1, "--verbosity")) -> None:
 
     try:
         store = fast.AuthKeyStore(cfg.authkeys_file)
-        cached = store.count()
+        per_dc = {dc: len(v) for dc, v in store._data.items() if v}
     except Exception:  # noqa: BLE001
-        cached = 0
-    table.add_row(
-        "auth key 缓存",
-        f"{cached} 条" if cached else "[dim]无（首次用 --auth-keys 会自动生成）[/dim]",
-    )
+        per_dc = {}
+    if per_dc:
+        detail = "，".join(f"DC{dc} {n} 条" for dc, n in sorted(per_dc.items(), key=lambda kv: int(kv[0])))
+        table.add_row("auth key 缓存", f"{sum(per_dc.values())} 条（{detail}）")
+    else:
+        table.add_row(
+            "auth key 缓存",
+            "[dim]无（首次用 --auth-keys 会自动生成并落盘）[/dim]",
+        )
 
     try:
         with Tdlib(cfg, verbosity=verbosity) as td:
@@ -498,6 +552,13 @@ def doctor(verbosity: int = typer.Option(1, "--verbosity")) -> None:
         table.add_row("fast 会话", _run(fast.whoami(cfg)) or "[yellow]未登录[/yellow]")
     except fast.FastError as exc:
         table.add_row("fast 会话", f"[red]{exc}[/red]")
+
+    table.add_row(
+        "记录的 DC",
+        f"会话 DC{cfg.session_dc}｜下载池 DC{cfg.pool_dc}"
+        if cfg.session_dc or cfg.pool_dc
+        else "[dim]暂无（跑一次 download 或 shell 就会写入）[/dim]",
+    )
 
     console.print(table)
 

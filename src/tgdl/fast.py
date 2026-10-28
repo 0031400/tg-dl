@@ -28,13 +28,16 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from .config import Config
+from .config import Config, remember_dc
 from .util import to_mtproto_message_id
 
 DEFAULT_CHUNK = 512 * 1024
 MAX_CHUNK = 1024 * 1024
 ALIGN = 4096
 MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024
+# 建连接 / 单次 RPC 的上限，避免网络卡住时无限挂起
+CONNECT_TIMEOUT = 25.0
+RPC_TIMEOUT = 30.0
 
 ProgressCb = Callable[[int, int], None]
 
@@ -183,7 +186,7 @@ class AuthKeyStore:
     注意：这个文件和 session 文件同等敏感（都是能直接读你消息的凭据），别外传。
     """
 
-    MAX_PER_DC = 5
+    MAX_PER_DC = 12
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -235,70 +238,124 @@ async def _open_with_key(client, dc_id: int, key: bytes):
 
     dc = await client._get_dc(dc_id)
     sender = MTProtoSender(AuthKey(key), loggers=client._log)
-    await sender.connect(
-        client._connection(dc.ip_address, dc.port, dc_id, loggers=client._log)
+    await asyncio.wait_for(
+        sender.connect(
+            client._connection(dc.ip_address, dc.port, dc_id, loggers=client._log)
+        ),
+        CONNECT_TIMEOUT,
     )
     try:
         # initConnection 每条连接要发一次；顺手当校验，key 失效会抛错
         init = copy.copy(client._init_request)
         init.query = _functions.help.GetConfigRequest()
-        await sender.send(InvokeWithLayerRequest(LAYER, init))
+        await asyncio.wait_for(sender.send(InvokeWithLayerRequest(LAYER, init)), RPC_TIMEOUT)
     except Exception:  # noqa: BLE001
         await _safe_disconnect(sender)
         raise
     return sender
 
 
-async def _fresh_sender(
+async def _connect_blank(client, dc_id: int):
+    """建一条还没授权的连接（DH 握手完成，尚未 importAuthorization）。"""
+    from telethon.network import MTProtoSender
+
+    dc = await client._get_dc(dc_id)
+    sender = MTProtoSender(None, loggers=client._log)
+    await asyncio.wait_for(
+        sender.connect(
+            client._connection(dc.ip_address, dc.port, dc_id, loggers=client._log)
+        ),
+        CONNECT_TIMEOUT,
+    )
+    return sender
+
+
+async def _fresh_senders(
     client,
-    dc_id: int | None,
+    dc_id: int,
+    count: int,
     store: "AuthKeyStore | None" = None,
     used: set[str] | None = None,
-):
-    """得到一条**独立 auth key** 的连接。
+) -> list:
+    """批量拿 ``count`` 条**独立 auth key** 连接。
 
-    Telegram 的 flood 预算按 auth key 计（不是按账号），所以多开几条能叠加吞吐。
-    优先复用落盘的 key（0.02s），没有再走 DH 握手（~3s）并缓存下来。
-    ``used`` 记录本次运行已经用掉的 key，避免同一个 key 被复用两次（那样就不独立了）。
+    两个关键约束（都是实测出来的）：
+
+    1. ``importAuthorization`` **不能并发**——服务端只放行一条，其余全部返回
+       ``AuthBytesInvalidError``（"The provided authorization is invalid"）。
+       并发创建 3 条时只有 1 条能成功。
+    2. DH 握手**可以并发**，而且它占了绝大部分时间（~3.4s）。
+
+    所以流程是：先吃缓存 → 并行 DH → 串行导出+导入。实测 4 条 8.3s
+    （全串行要 14s），而且 4/4 都成功。
     """
+    if count <= 0:
+        return []
+
     from telethon import functions as _functions
     from telethon.client.telegrambaseclient import LAYER
-    from telethon.network import MTProtoSender
     from telethon.tl.functions import InvokeWithLayerRequest
 
-    target = dc_id or client.session.dc_id
+    out: list = []
+    pending = count
 
+    # 1) 缓存命中直接连（不做 DH）
     if store is not None:
-        for key_hex in store.keys(target):
+        for key_hex in store.keys(dc_id):
+            if pending <= 0:
+                break
             if used is not None:
                 if key_hex in used:
-                    continue  # 这条已经被别的任务占了，要的是独立 key
-                used.add(key_hex)  # 先占位（await 之前），并发任务不会抢同一条
+                    continue
+                used.add(key_hex)   # 先占位，别被并发的另一批抢走
             try:
-                return await _open_with_key(client, target, bytes.fromhex(key_hex))
+                sender = await _open_with_key(client, dc_id, bytes.fromhex(key_hex))
             except Exception:  # noqa: BLE001
                 if used is not None:
                     used.discard(key_hex)
-                store.drop(target, key_hex)  # 失效了就丢掉
+                store.drop(dc_id, key_hex)   # 失效就丢掉
+                continue
+            out.append(sender)
+            pending -= 1
 
-    dc = await client._get_dc(target)
-    sender = MTProtoSender(None, loggers=client._log)
-    await sender.connect(
-        client._connection(dc.ip_address, dc.port, target, loggers=client._log)
+    if pending <= 0:
+        return out
+
+    # 2) 并行握手（省掉 N 倍的 3.4s）
+    results = await asyncio.gather(
+        *[_connect_blank(client, dc_id) for _ in range(pending)],
+        return_exceptions=True,
     )
-    try:
-        auth = await client(_functions.auth.ExportAuthorizationRequest(target))
-        init = copy.copy(client._init_request)
-        init.query = _functions.auth.ImportAuthorizationRequest(id=auth.id, bytes=auth.bytes)
-        await sender.send(InvokeWithLayerRequest(LAYER, init))
-    except Exception:  # noqa: BLE001
-        await _safe_disconnect(sender)
-        raise
-    if store is not None and sender.auth_key is not None:
-        store.add(target, sender.auth_key.key)
-        if used is not None:
-            used.add(sender.auth_key.key.hex())
-    return sender
+    blanks = []
+    for item in results:
+        if isinstance(item, BaseException):
+            print(f"[fast] 握手失败：{type(item).__name__}: {str(item)[:80]}")
+            continue
+        blanks.append(item)
+
+    # 3) 串行导出 + 导入（并发会被服务端拒）
+    for sender in blanks:
+        try:
+            auth = await asyncio.wait_for(
+                client(_functions.auth.ExportAuthorizationRequest(dc_id)), RPC_TIMEOUT
+            )
+            init = copy.copy(client._init_request)
+            init.query = _functions.auth.ImportAuthorizationRequest(
+                id=auth.id, bytes=auth.bytes
+            )
+            await asyncio.wait_for(
+                sender.send(InvokeWithLayerRequest(LAYER, init)), RPC_TIMEOUT
+            )
+        except Exception as exc:  # noqa: BLE001
+            await _safe_disconnect(sender)
+            print(f"[fast] auth key 创建失败：{type(exc).__name__}: {str(exc)[:80]}")
+            continue
+        if store is not None and sender.auth_key is not None:
+            store.add(dc_id, sender.auth_key.key)
+            if used is not None:
+                used.add(sender.auth_key.key.hex())
+        out.append(sender)
+    return out
 
 
 async def _get_file(client, sender, location, offset: int, limit: int, *, cdn: bool) -> bytes:
@@ -428,6 +485,96 @@ class AdaptiveLimiter:
 # --------------------------------------------------------------------------- #
 # 并行下载
 # --------------------------------------------------------------------------- #
+# 连接池构建
+# --------------------------------------------------------------------------- #
+
+async def _build_pairs(
+    client,
+    clients: list,
+    target: int,
+    dc_id: int | None,
+    auth_keys: int,
+    key_store: "AuthKeyStore | None",
+    stack,
+) -> list:
+    """建一组可并行的 (client, sender)。优先用缓存 auth key，不做多余 DH。"""
+    need_extra = max(0, auth_keys - 1)
+    cached_before = set(key_store.keys(target)) if key_store else set()
+
+    # 文件就在会话自己的 DC 上：exportAuthorization 不允许导出本 DC，
+    # 派生额外 key 必然失败（还会打一堆错），直接用会话自己的连接即可。
+    if dc_id is not None and dc_id == client.session.dc_id:
+        if auth_keys > 1:
+            print(
+                f"[fast] DC{dc_id} 是会话自身所在 DC，无法派生额外 auth key"
+                " → 只用 1 条连接（速度会低于多 key 模式）"
+            )
+        pairs: list = []
+        for one in clients:
+            sender = await stack.enter_async_context(_sender_for(one, dc_id))
+            pairs.append((one, sender))
+        return pairs
+
+    # 能不能用缓存 key 顶掉「借导出连接」那一条？
+    # 借导出连接本身要做一次全新 DH（实测 ~3.4s），而缓存 key 直连只要 ~1.1s，
+    # 所以只要缓存里有货、且文件在别的 DC（导出授权只对非本 DC 有效），就优先用缓存。
+    cache_primary = (
+        key_store is not None
+        and bool(cached_before)
+        and len(clients) == 1
+        and dc_id is not None
+        and dc_id != client.session.dc_id
+    )
+    slots = auth_keys if cache_primary else need_extra
+
+    # 预检信息必须在任何慢操作（借导出连接 / DH 握手）之前打印出来
+    if slots > 0:
+        if key_store is None:
+            print(f"[fast] 需要 {slots} 条 auth key（未启用缓存，全部现场生成）")
+        elif len(cached_before) >= slots:
+            print(
+                f"[fast] auth key DC{target}：缓存 {len(cached_before)} 条，"
+                f"需要 {slots} 条 → 全部复用，免 DH 握手"
+            )
+        else:
+            print(
+                f"[fast] auth key DC{target}：缓存 {len(cached_before)} 条，"
+                f"需要 {slots} 条 → 复用 {len(cached_before)} 条，"
+                f"新生成 {slots - len(cached_before)} 条"
+            )
+
+    pairs: list = []
+    if slots > 0:
+        used: set[str] = set()
+        for sender in await _fresh_senders(client, target, slots, key_store, used):
+            stack.push_async_callback(_safe_disconnect, sender)
+            pairs.append((client, sender))
+
+    # 一条都没建起来（或本来就不走缓存）→ 退回会话自己的连接
+    if not pairs:
+        for one in clients:
+            sender = await stack.enter_async_context(_sender_for(one, dc_id))
+            pairs.append((one, sender))
+    elif len(clients) > 1:
+        # 多登录会话：把它们各自的连接也加进来一起摊请求
+        for one in clients[1:]:
+            sender = await stack.enter_async_context(_sender_for(one, dc_id))
+            pairs.append((one, sender))
+
+    if len(pairs) > 1 and key_store is not None:
+        cached_after = set(key_store.keys(target))
+        fresh_count = len(cached_after - cached_before)
+        print(
+            f"[fast] 使用 {len(pairs)} 条独立 auth key 并行下载"
+            f"（复用 {len(pairs) - fresh_count} 条缓存，新生成 {fresh_count} 条，"
+            f"DC{target} 现有 {len(cached_after)} 条）"
+        )
+    elif len(pairs) > 1:
+        print(f"[fast] 使用 {len(pairs)} 条独立 auth key 并行下载")
+    return pairs
+
+
+# --------------------------------------------------------------------------- #
 
 async def download_location(
     client,
@@ -445,6 +592,7 @@ async def download_location(
     extra_clients: list | None = None,
     resume_offsets: set[int] | None = None,
     on_chunk: Callable[[int, int], None] | None = None,
+    senders: list | None = None,
     on_progress: ProgressCb | None = None,
 ) -> Path:
     """并行下载一个文件。
@@ -452,6 +600,9 @@ async def download_location(
     ``extra_clients`` 是额外登录会话（每个都是一条独立 auth key）。
     Telegram 的 flood 预算按 auth key 算，所以多个会话能把请求摊开、叠加吞吐；
     ``connections`` 则是所有会话加起来的总在途请求数。
+
+    ``senders`` 传入 ``[(client, sender), ...]`` 时直接复用这组连接，
+    不再自己建（``tgdl shell`` 的连接池就是走这条路，省掉每次建连的开销）。
     """
     _, errors, functions, types = _telethon()
     if size <= 0:
@@ -484,31 +635,16 @@ async def download_location(
     started = time.monotonic()
 
     clients = [client, *(extra_clients or [])]
-    async with contextlib.AsyncExitStack() as stack:
-        # 每个会话一条（或一组）连接；请求按 worker 轮流分给各会话
-        pairs = []
-        for one in clients:
-            sender = await stack.enter_async_context(_sender_for(one, dc_id))
-            pairs.append((one, sender))
+    target = dc_id or client.session.dc_id
 
-        # 额外 auth key：每条是独立的 flood 预算，请求按 worker 轮流摊过去
-        if auth_keys > 1:
-            target = dc_id or client.session.dc_id
-            used: set[str] = set()
-            # 并行建立，省掉串行等 DH 的时间
-            results = await asyncio.gather(
-                *[_fresh_sender(client, target, key_store, used)
-                  for _ in range(auth_keys - 1)],
-                return_exceptions=True,
+    async with contextlib.AsyncExitStack() as stack:
+        if senders is not None:
+            # 调用方（shell / serve）已经建好连接池，直接拿来用
+            pairs = list(senders)
+        else:
+            pairs = await _build_pairs(
+                client, clients, target, dc_id, auth_keys, key_store, stack
             )
-            for item in results:
-                if isinstance(item, BaseException):
-                    print(f"[fast] 额外 auth key 创建失败：{item}（回退到 {len(pairs)} 条）")
-                    continue
-                stack.push_async_callback(_safe_disconnect, item)
-                pairs.append((client, item))
-            if len(pairs) > 1:
-                print(f"[fast] 使用 {len(pairs)} 条独立 auth key 并行下载")
 
         async def fetch(pair, offset: int) -> bytes:
             owner, sender = pair
@@ -785,6 +921,7 @@ async def download_message(
             extra.append(helper)
         message = await _fetch_message(client, chat_id, message_id)
         location, size, name, dc_id = _location_from_message(message, types)
+        remember_dc(cfg, session_dc=client.session.dc_id, pool_dc=dc_id)
         size = int(size)
         if limit:
             size = min(size, int(limit))
