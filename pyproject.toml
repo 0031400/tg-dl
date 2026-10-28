@@ -1,0 +1,25 @@
+[project]
+name = "tgdl"
+version = "0.1.0"
+description = "Telegram file downloader: TDLib engine + a faster raw-MTProto engine"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12.3",
+    "rich>=13.7",
+    "telethon>=1.36",
+    "cryptg>=0.6.0",
+]
+
+[project.scripts]
+tgdl = "tgdl.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tgdl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

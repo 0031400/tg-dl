@@ -1,0 +1,182 @@
+# tgdl
+
+Telegram 文件下载器。输入只有一种格式：**`chat_id:message_id`**。
+
+| 引擎 | 传输 | 说明 |
+| --- | --- | --- |
+| `fast` | 原生 MTProto（Telethon，`upload.getFile`） | **默认引擎**，单文件多连接并行，大文件通常比 TDLib 快 2~5 倍 |
+| `tdlib` | TDLib 1.8（`tdjson.dll`，ctypes） | 基线，行为与官方客户端一致 |
+
+要求：Python ≥ 3.11、[uv](https://docs.astral.sh/uv/)、一个可用的 `tdjson` 动态库（仅 `tdlib` 引擎需要）。
+
+## 快速开始
+
+```bash
+cd D:/file/python/tg-dl
+uv sync
+
+# 1. 写配置（api_id / api_hash 从 https://my.telegram.org 申请）
+uv run tgdl init --api-id 123456 --api-hash 0123456789abcdef0123456789abcdef
+
+# 2. 登录（两个引擎各自一个会话；只用 fast 就 --engine fast）
+uv run tgdl login --engine all
+
+# 3. 看消息里是什么文件
+uv run tgdl info 8913476869:6733
+
+# 4. 下载
+uv run tgdl download 8913476869:6733 -o out.mp4
+uv run tgdl download -1001234567890:42 -o D:/downloads/     # 给已存在的目录就用原文件名
+
+# 5. 同一个文件实测两边速度
+uv run tgdl bench 8913476869:6733 -c 4,8,16,32
+
+# 6. 退出登录
+uv run tgdl logout
+```
+
+`tdjson` 路径默认 `D:\file\cpp\lib\tdlib\bin\tdjson.dll`（可用 `--tdjson` 或环境变量 `TGDL_TDJSON` 覆盖）。
+配置查找顺序：`--config` → `$TGDL_CONFIG` → `./.tgdl/config.toml` → `~/.tgdl/config.toml`。
+
+## 输入格式
+
+```
+chat_id:message_id
+```
+
+- **chat_id**：频道/超级群是 `-100xxxxxxxxxx`，普通群是 `-xxxxxxxxxx`，用户是正数。
+- **message_id**：MTProto 的原始 id（如 `6733`）和 TDLib 的 id（`6733 << 20`）都接受，程序会自动识别并转换
+  （TDLib 把服务端 id 存在高 20 位以上，见 `td/telegram/MessageId.h`）。
+
+两个引擎拿到同一个 `chat_id:message_id` 后各自去取消息：
+
+- `fast`：`messages.getMessages` 拿消息 → 从 `document` / `photo` 里取
+  `id / access_hash / file_reference / dc_id` → 多连接并行 `upload.getFile`；
+- `tdlib`：`getMessage`（本地库）→ 查不到就用 `getChatHistory` 回源 → `downloadFile`。
+
+因为每次都是从消息里现取定位信息，**不存在 file_reference 过期的问题**，照片也能直接下。
+
+## 为什么 fast 能比 TDLib 快
+
+不是玄学，是 TDLib 自己给自己设了上限（源码 `D:\file\cpp\td-1.8.0`）：
+
+1. **全局在途预算只有 2 MiB**
+   `td/telegram/files/ResourceManager.h` → `MAX_RESOURCE_LIMIT = 1 << 21`，
+   整个客户端所有文件加载共享这 2 MiB 的"在途数据"额度。
+
+2. **分片被自动放大到 512 KiB**
+   `td/telegram/files/PartsManager.cpp` → 从 64 KiB 起翻倍直到分片数 ≤ `MAX_PART_COUNT`(4000)，
+   上限 `MAX_PART_SIZE = 512 KiB`。
+
+   于是 1 GiB 文件：part_size = 512 KiB，在途分片 ≈ 2 MiB / 512 KiB ≈ **4 个并发请求**。
+   这就是单文件下载吃不满带宽的根本原因。
+
+3. **单 DC 连接数上限 10**（`ConnectionCreator.cpp`），所有请求复用这 10 条连接。
+
+`fast` 引擎绕开这套调度：直接对目标 DC 发 `upload.getFile`，默认 **16 个并发**、
+固定 **512 KiB** 分片（可用 `-c/--chunk` 调到 32/64 并发与 1 MiB），每个 worker 持有独立文件句柄
+按偏移写盘，无 per-part fsync、无分片哈希校验。文件不在本会话的 DC 上时会自动借导出连接
+（`_borrow_exported_sender`），不会 `FILE_MIGRATE`。
+
+> **`--connections` 是"在途请求数"，不是 TCP 连接数。** 这些请求共用一条 TCP 连接，
+> 靠 MTProto 多路复用并发。实测（同一个 556 MB 文件，各跑 32 MB）：
+>
+> | 配置 | 总在途 | 吞吐 | FLOOD_WAIT |
+> | --- | --- | --- | --- |
+> | 1 TCP × 16 | 16 | **5.5 MB/s** | 0 |
+> | 4 TCP × 4 | 16 | 4.3 MB/s | 0 |
+> | 2 TCP × 16 | 32 | 3.0 MB/s | 18 次 / 20s |
+> | 4 TCP × 16 | 64 | 2.6 MB/s | 56 次 / 112s |
+>
+> 结论：**单连接 + 16 在途就是最优点**。TCP 数不影响吞吐，在途数超过 ~24 反而因为
+> Telegram 按账号限流（`FLOOD_WAIT`）而变慢，连接还会被服务端重置。`-c` 超过 24 时 CLI 会提示。
+
+### FLOOD_WAIT 是自适应的，不是死循环
+
+Telegram 的 flood 限制按**账号**算。如果撞上以后还保持原并发猛发，就会陷入
+「限流 → 睡 → 突发 → 再限流」，用户看到的就是刷屏的 `FLOOD_WAIT`。
+
+`fast` 引擎里有一个 `AdaptiveLimiter`（同 TDLib 的 `ResourceManager` 思路）：
+
+- 撞到限流 → 在途额度**砍半**，并记一个**全局冷却时间点**，所有 worker 在这之前都不再发请求
+  （避免睡醒后集体突发）；
+- 连续成功 → 额度慢慢涨回 `-c` 给的上限。
+
+实测 96 MB：改之前 32 MB 就能触发 56 次（累计等 112 秒）；改之后 96 MB 只有 4 次、每次 1 秒，
+并发自动从 16 降到 1 再涨回 9，下载全程没有卡顿。所以偶尔看到一两条 `FLOOD_WAIT` 是正常的
+自动降速，不是出错。
+
+### ⚠️ 必须装 cryptg，否则前功尽弃
+
+Telethon 的 AES-IGE 加解密有三档实现：`cryptg`（C 扩展）→ `libssl` → **纯 Python 的 pyaes**。
+没装 `cryptg` 时会静默退回 pyaes，**解密成为唯一瓶颈，吞吐死死卡在 300~400 KB/s，
+而且加并发完全无效**——看起来就像"网络慢"。
+
+实测同一个 556 MB 文件（DC4）：
+
+| 配置 | 速度 |
+| --- | --- |
+| 纯 Python AES（pyaes），4/8/16 并发 | 0.33 MB/s（并发无提升） |
+| 装 cryptg 后，8 并发 | 3.4 MB/s |
+| 装 cryptg 后，16 并发 | 3.2 MB/s |
+| TDLib 自带下载器 | 3.8 MB/s |
+
+`cryptg` 已在依赖里，`tgdl doctor` 会检查这一项；缺失时 `fast` 引擎启动会直接告警。
+**如果你看到几百 KB/s 且加并发没用，先查这个。**
+
+> 实测注意：fast 每次运行要新建连接 + 取消息（约 1~2 秒固定开销），
+> 所以**小文件（几百 KB 以内）会比 TDLib 慢**，倍速优势在大文件上才体现出来。
+> `tgdl bench` 会自动清掉 TDLib 的本地缓存再比，避免缓存命中导致数据失真；
+> 大文件加 `--mb 64` 只测前 64 MB，几十秒就能出结果。
+
+## 命令一览
+
+| 命令 | 作用 |
+| --- | --- |
+| `tgdl init` | 写 `./.tgdl/config.toml` |
+| `tgdl login [--engine tdlib\|fast\|all]` | 登录（会话持久化在 `.tgdl/`） |
+| `tgdl logout` | 退出登录并清理会话 |
+| `tgdl whoami` | 两个引擎的登录状态 |
+| `tgdl info <chat_id:message_id>` | 看文件名 / 大小 / 类型 / DC，不下载 |
+| `tgdl download <chat_id:message_id> [-o 路径] [-c 16] [--chunk 512K] [--engine auto\|fast\|tdlib]` | 下载 |
+| `tgdl bench <chat_id:message_id> [-c 4,8,16,32] [--mb 64]` | 同文件对比两个引擎（`--mb` 只测前 N MB） |
+| `tgdl doctor` | 自检配置 / dll / 会话 |
+
+`--engine auto`（默认）：fast 会话已登录就用 fast，否则退回 tdlib。
+
+## 已知限制
+
+- **fast 需要会话缓存在本地**。Telethon 只知道 id 的频道/群需要先有 `access_hash`，
+  程序会在缓存缺失时扫一次会话列表；如果账号根本不在那个会话里，会直接报错。
+- **tdlib 需要会话已在它的库里**。普通群（非超级群）如果 TDLib 没见过，无法凭空创建，
+  请先在客户端打开一次该会话，或改用 `--engine fast`。
+- **CDN 文件**：服务器返回 `FILE_CDN_REDIRECT` 时会自动切回直连重试（不实现 CDN 解密），
+  极端情况下比 TDLib 走 CDN 慢，可加 `--engine tdlib` 对比。
+
+## 想让 TDLib 自己也变快？
+
+如果必须留在 TDLib 内部（比如要复用它已有的会话），可以改源码后重编。仓库里带了脚本：
+
+```bash
+uv run python scripts/patch_tdlib.py --td-src D:/file/cpp/td-1.8.0          # 打补丁（自动备份 .bak）
+uv run python scripts/patch_tdlib.py --td-src D:/file/cpp/td-1.8.0 --revert # 撤销
+```
+
+它只改两处：`ResourceManager.h` 的 `MAX_RESOURCE_LIMIT`（2 MiB → 64 MiB）、
+`ConnectionCreator.cpp` 的 `MAX_CONNECTIONS`（10 → 64）。
+重编后把新的 `tdjson.dll` 换掉，`--engine tdlib` 就会跟着变快；`tgdl bench` 可以直接量出差异。
+
+## 目录结构
+
+```
+src/tgdl/
+  cli.py      # typer 命令行
+  tdjson.py   # tdjson.dll 的 ctypes 绑定 + 登录/登出/取消息/下载
+  fast.py     # 原生 MTProto 并行下载（Telethon）
+  config.py   # config.toml / 环境变量
+  util.py     # chat_id:message_id 解析、进度条、体积格式化
+scripts/
+  patch_tdlib.py   # 给 TDLib 源码打提速补丁
+tests/
+  test_target.py   # 目标解析与 message_id 转换单测（uv run --with pytest pytest -q）
+```
