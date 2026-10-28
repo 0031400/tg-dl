@@ -265,8 +265,8 @@ def download(
     ),
     engine: str = typer.Option("auto", "--engine", help="auto | fast | tdlib"),
     connections: int = typer.Option(
-        16, "--connections", "-c",
-        help="fast 引擎并发在途请求数（同一条 TCP 上多路复用，不是 TCP 连接数）",
+        4, "--connections", "-c",
+        help="每条 TCP 连接的并发请求数（总并发 = auth-keys × 该值）",
     ),
     chunk: str = typer.Option("512K", "--chunk", help="fast 引擎分片大小（最大 1M）"),
     fixed: bool = typer.Option(
@@ -296,10 +296,11 @@ def download(
         engine = "fast" if _run(fast.whoami(cfg)) else "tdlib"
 
     if engine == "fast":
-        if connections > 24:
+        total_inflight = auth_keys * connections
+        if total_inflight > 32:
             console.print(
-                f"[yellow]提示：{connections} 个在途请求容易触发 FLOOD_WAIT，"
-                "实测 16 左右吞吐最高[/yellow]"
+                f"[yellow]提示：{auth_keys} 条连接 × 每条 {connections} 个在途 = "
+                f"{total_inflight} 个并发请求，容易触发 FLOOD_WAIT（建议 ≤ 32）[/yellow]"
             )
         if auth_keys > 8:
             console.print(
@@ -313,7 +314,7 @@ def download(
                         cfg, chat_id, message_id, output,
                         connections=connections, chunk=chunk_bytes,
                         adaptive=not fixed, auth_keys=auth_keys,
-                        on_progress=bar.update,
+                        on_conns=bar.update_conns, on_progress=bar.update,
                     )
                 )
         except fast.FastError as exc:
@@ -366,7 +367,7 @@ def _report(dest: Path, size: int, elapsed: float) -> None:
 @app.command()
 def bench(
     target: str = typer.Argument(..., help="chat_id:message_id"),
-    connections: str = typer.Option("4,8,16,32", "--connections", "-c", help="并发数列表"),
+    connections: str = typer.Option("2,4,8", "--connections", "-c", help="每条连接的并发数列表"),
     chunk: str = typer.Option("512K", "--chunk"),
     keep: bool = typer.Option(False, "--keep", help="保留下载的临时文件"),
     mb: int = typer.Option(0, "--mb", help="只测前 N MB（0 = 整个文件），大文件快速对比用"),
@@ -458,7 +459,7 @@ def shell(
         3, "--auth-keys", help="连接池里的独立 auth key 总数（含主会话）"
     ),
     connections: int = typer.Option(
-        16, "--connections", "-c", help="总在途请求数（所有 key 加起来）"
+        4, "--connections", "-c", help="每条连接的并发请求数（总数 = auth-keys × 该值）"
     ),
     chunk: str = typer.Option("512K", "--chunk", help="分片大小（最大 1M）"),
     fixed: bool = typer.Option(

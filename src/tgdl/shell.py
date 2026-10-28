@@ -27,7 +27,7 @@ from .util import human_size, parse_target
 @dataclass
 class PoolOptions:
     auth_keys: int = 3
-    connections: int = 16
+    connections: int = 4
     chunk: int = fast.DEFAULT_CHUNK
     adaptive: bool = False
     dc_id: int | None = None
@@ -146,7 +146,7 @@ class FastPool:
             return "连接池未建立（第一次 dl 时会按文件所在 DC 建）"
         return (
             f"DC{self.dc_id}｜{len(self.senders)} 条 auth key 连接"
-            f"｜在途 {self.opts.connections}"
+            f"｜每条 {self.opts.connections} 在途"
             f"｜分片 {human_size(self.opts.chunk)}"
             f"｜{'自适应' if self.opts.adaptive else '固定并发'}"
             f"｜建池 {self.build_seconds:.2f}s"

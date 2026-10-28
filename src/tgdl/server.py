@@ -43,7 +43,7 @@ class Settings:
     """全部是固定值，不做动态调整（--fixed 的语义）。"""
 
     download_dir: str = ""
-    connections: int = 16      # 一条连接上并行多少个请求
+    connections: int = 4       # 每条连接上并行多少个请求
     auth_keys: int = 3         # 几条独立 auth key
     fixed: bool = True         # 固定并发，关掉自适应
     chunk: str = "512K"

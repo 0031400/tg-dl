@@ -490,6 +490,35 @@ async def _fresh_senders(
     return out
 
 
+def _key_tag(sender) -> str:
+    """连接用的 auth key 前 8 位，用来区分不同连接。"""
+    key = getattr(sender, "auth_key", None)
+    raw = getattr(key, "key", None) if key is not None else None
+    return raw.hex()[:8] if raw else "session"
+
+
+def _report_per_conn(pairs: list, per_conn: dict, elapsed: float, workers: int) -> None:
+    """打印每条连接实际搬了多少字节 —— 用来验证多 key 到底有没有生效。"""
+    total = sum(v.get("total", 0) for v in per_conn.values()) or 1
+    print(
+        f"[fast] 每条连接的实际用量（{len(pairs)} 条连接，"
+        f"每条 {workers} 个在途，共 {total / 1048576:.1f} MB / {elapsed:.2f}s）"
+    )
+    for idx, (_owner, sender) in enumerate(pairs):
+        st = per_conn.get(idx, {"window": 0, "total": 0, "reqs": 0})
+        moved = st.get("total", 0)
+        share = moved / total * 100
+        speed = moved / elapsed / 1048576 if elapsed > 0 else 0
+        tag = _key_tag(sender)
+        if moved == 0:
+            print(f"  #{idx + 1}  key={tag}  未使用（0 请求）")
+        else:
+            print(
+                f"  #{idx + 1}  key={tag}  {moved / 1048576:8.1f} MB  "
+                f"{share:5.1f}%  {speed:6.2f} MB/s  {st['reqs']:4d} 请求"
+            )
+
+
 async def _get_file(client, sender, location, offset: int, limit: int, *, cdn: bool) -> bytes:
     _, errors, functions, types = _telethon()
     request = functions.upload.GetFileRequest(
@@ -722,7 +751,7 @@ async def download_location(
     dest: Path,
     *,
     dc_id: int | None = None,
-    connections: int = 16,
+    connections: int = 4,   # 每条连接的并发请求数
     chunk: int = DEFAULT_CHUNK,
     retries: int = 6,
     adaptive: bool = True,
@@ -732,6 +761,7 @@ async def download_location(
     resume_offsets: set[int] | None = None,
     on_chunk: Callable[[int, int], None] | None = None,
     senders: list | None = None,
+    on_conns: Callable[[list[float]], None] | None = None,
     on_progress: ProgressCb | None = None,
 ) -> Path:
     """并行下载一个文件。
@@ -746,6 +776,13 @@ async def download_location(
     _, errors, functions, types = _telethon()
     if size <= 0:
         raise FastError("文件大小为 0")
+    requested_keys = auth_keys
+    total_inflight = max(1, auth_keys) * max(1, connections)
+    if total_inflight > 32:
+        print(
+            f"[fast] 注意：{auth_keys} 条连接 × 每条 {connections} 个在途 = "
+            f"{total_inflight} 个并发请求，很容易触发 FLOOD_WAIT（建议总数 ≤ 32）"
+        )
     chunk = max(ALIGN, min(chunk, MAX_CHUNK) // ALIGN * ALIGN)
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -770,8 +807,26 @@ async def download_location(
     resumed_bytes = sum(min(chunk, size - off) for off in done_offsets)
     state = {"done": resumed_bytes, "cdn": True}
     lock = asyncio.Lock()
-    limiter = AdaptiveLimiter(connections, adaptive=adaptive)
+    per_conn: dict[int, dict[str, int]] = {}
+    pairs_ref: list = []
+    tick_last = [time.monotonic()]
     started = time.monotonic()
+
+    def emit_conns(now: float) -> None:
+        """每 0.5s 读一次各连接的窗口计数：速度 = 窗口字节 / 实际间隔，然后**置零**。
+
+        计数是「这条 TCP 上一次采样以来写盘了多少字节」，显示完立刻清零，
+        所以下一个窗口从头开始数，不会因为累计值越来越大而看不出变化。
+        """
+        dt = max(now - tick_last[0], 1e-6)
+        tick_last[0] = now
+        speeds: list[float] = []
+        for i in range(len(pairs_ref)):
+            st = per_conn.setdefault(i, {"window": 0, "total": 0, "reqs": 0})
+            speeds.append(st["window"] / dt)
+            st["window"] = 0          # 置零，下个窗口重新累计
+        if on_conns is not None:
+            on_conns(speeds)
 
     clients = [client, *(extra_clients or [])]
     target = dc_id or client.session.dc_id
@@ -784,17 +839,25 @@ async def download_location(
             pairs = await _build_pairs(
                 client, clients, target, dc_id, auth_keys, key_store, stack
             )
+        pairs_ref[:] = pairs
 
-        async def fetch(pair, offset: int) -> bytes:
-            owner, sender = pair
+        # 每条连接一个独立的限流器：并发额度、flood 冷却都是它自己的
+        limiters = [AdaptiveLimiter(connections, adaptive=adaptive) for _ in pairs]
+        for i in range(len(pairs)):
+            per_conn[i] = {"window": 0, "total": 0, "reqs": 0}
+        tick_last[0] = time.monotonic()
+
+        async def fetch(idx: int, offset: int) -> bytes:
+            lim = limiters[idx]
+            owner, sender = pairs[idx]
             last: Exception | None = None
             for attempt in range(retries):
-                await limiter.wait_cooldown()  # 全局冷却期内不发起任何请求
+                await lim.wait_cooldown()      # 只有这条连接会被卡住
                 try:
                     data = await _get_file(
                         owner, sender, location, offset, chunk, cdn=state["cdn"]
                     )
-                    limiter.note_success()
+                    lim.note_success()
                     return data
                 except _CdnRedirect:
                     state["cdn"] = False  # 退回非 CDN 直连，下一轮重试
@@ -811,14 +874,15 @@ async def download_location(
                     ) from exc
                 except errors.FloodWaitError as exc:
                     wait = int(getattr(exc, "seconds", 1))
-                    new_limit = await limiter.note_flood(wait)
-                    if limiter.adaptive:
-                        detail = f"在途并发降到 {new_limit}"
-                    else:
-                        detail = f"保持并发 {new_limit}（固定模式）"
+                    new_limit = await lim.note_flood(wait)
+                    tail = (
+                        f"该连接并发降到 {new_limit}"
+                        if lim.adaptive
+                        else f"该连接并发保持 {new_limit}"
+                    )
                     print(
-                        f"[fast] FLOOD_WAIT {wait}s，{detail}"
-                        f"（累计 {limiter.floods} 次）"
+                        f"[fast] 连接 #{idx + 1} FLOOD_WAIT {wait}s：暂停这条连接 "
+                        f"{wait}s，其余连接继续（{tail}，累计 {lim.floods} 次）"
                     )
                     last = exc
                 except (errors.RPCError, OSError) as exc:
@@ -826,8 +890,8 @@ async def download_location(
                     await asyncio.sleep(min(2 ** attempt * 0.5, 8))
             raise FastError(f"offset {offset} 重试 {retries} 次仍失败: {last}")
 
-        async def worker(slot: int) -> None:
-            pair = pairs[slot % len(pairs)]
+        async def worker(idx: int) -> None:
+            lim = limiters[idx]
             handle = dest.open("r+b", buffering=0)
             try:
                 while True:
@@ -835,12 +899,12 @@ async def download_location(
                         offset = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         return
-                    await limiter.wait_cooldown()
-                    await limiter.acquire()
+                    await lim.wait_cooldown()
+                    await lim.acquire()
                     try:
-                        data = await fetch(pair, offset)
+                        data = await fetch(idx, offset)
                     finally:
-                        await limiter.release()
+                        await lim.release()
                     if not data:
                         continue
                     handle.seek(offset)
@@ -854,14 +918,31 @@ async def download_location(
                         on_chunk(offset, len(data))
                     async with lock:
                         state["done"] += len(data)
+                        st = per_conn[idx]
+                        st["window"] += len(data)
+                        st["total"] += len(data)
+                        st["reqs"] += 1
                         if on_progress:
                             on_progress(state["done"], size)
             finally:
                 handle.close()
 
+        async def ticker() -> None:
+            """严格每 0.5s：刷新写入进度 + 采样各连接窗口计数并置零。"""
+            while True:
+                await asyncio.sleep(0.5)
+                now = time.monotonic()
+                if on_progress:
+                    on_progress(state["done"], size)
+                emit_conns(now)
+
+        # 每条连接开 connections 个 worker，它们共用一个「该连接的并发额度」
         workers = [
-            asyncio.create_task(worker(i)) for i in range(max(1, connections))
+            asyncio.create_task(worker(i))
+            for i in range(len(pairs))
+            for _ in range(max(1, connections))
         ]
+        tick_task = asyncio.create_task(ticker())
         try:
             done, pending = await asyncio.wait(workers, return_when=asyncio.FIRST_EXCEPTION)
             for task in done:
@@ -875,15 +956,22 @@ async def download_location(
             for task in workers:
                 task.cancel()
             raise
+        finally:
+            tick_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await tick_task
 
     elapsed = time.monotonic() - started
-    if limiter.floods:
-        tail = (
-            f"并发已自适应到 {limiter.limit}（上限 {limiter.max_limit}）"
-            if limiter.adaptive
-            else f"并发固定为 {limiter.limit}"
-        )
-        print(f"[fast] 本次共遇到 {limiter.floods} 次 FLOOD_WAIT，{tail}")
+    if len(pairs) > 1 or requested_keys > 1:
+        _report_per_conn(pairs, per_conn, elapsed, connections)
+    total_floods = sum(l.floods for l in limiters)
+    if total_floods:
+        detail = "，".join(
+            f"#{i + 1} 降到 {l.limit}/{l.max_limit}"
+            for i, l in enumerate(limiters)
+            if l.floods and l.adaptive
+        ) or "全部保持原并发"
+        print(f"[fast] 本次共 {total_floods} 次 FLOOD_WAIT（{detail}）")
     if state["done"] < size:
         # 探测的大小可能偏大，按实际写入量截断
         os.truncate(dest, state["done"])
@@ -1031,7 +1119,7 @@ async def download_message(
     message_id: int,
     dest: Path | None,
     *,
-    connections: int = 16,
+    connections: int = 4,   # 每条连接的并发请求数
     chunk: int = DEFAULT_CHUNK,
     limit: int = 0,
     adaptive: bool = True,
@@ -1040,6 +1128,7 @@ async def download_message(
     resume_offsets: set[int] | None = None,
     on_chunk: Callable[[int, int], None] | None = None,
     on_info: Callable[[str, int], None] | None = None,
+    on_conns: Callable[[list[float]], None] | None = None,
     on_progress: ProgressCb | None = None,
 ) -> tuple[Path, float, str, int]:
     """按 chat_id:message_id 下载消息里的文件。
@@ -1087,7 +1176,7 @@ async def download_message(
                 key_store=AuthKeyStore(cfg.authkeys_file),
                 extra_clients=extra,
                 resume_offsets=resume_offsets, on_chunk=on_chunk,
-                on_progress=on_progress,
+                on_conns=on_conns, on_progress=on_progress,
             )
         except errors.FileReferenceExpiredError as exc:
             raise FastError(

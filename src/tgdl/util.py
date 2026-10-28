@@ -84,6 +84,7 @@ class ProgressBar:
         self._progress = Progress(
             TextColumn("[bold]{task.description}"),
             BarColumn(bar_width=None),
+            TextColumn("{task.fields[conns]}", style="cyan"),
             DownloadColumn(),
             TransferSpeedColumn(),
             TimeRemainingColumn(),
@@ -96,7 +97,7 @@ class ProgressBar:
 
     def __enter__(self) -> "ProgressBar":
         self._progress.start()
-        self._task_id = self._progress.add_task(self._label, total=None)
+        self._task_id = self._progress.add_task(self._label, total=None, conns="")
         return self
 
     def __exit__(self, *exc) -> None:
@@ -106,3 +107,17 @@ class ProgressBar:
         if self._task_id is None:
             return
         self._progress.update(self._task_id, completed=done, total=total or None)
+
+    def update_conns(self, speeds: list[float]) -> None:
+        """在进度条同一行显示每条 TCP 连接的实时速度（MiB/s）。
+
+        按终端宽度决定显示几条，避免挤到换行。
+        """
+        if self._task_id is None or not speeds:
+            return
+        budget = max(4, (console.width - 70) // 5)   # 每个数字约 5 列
+        shown = speeds[:budget]
+        text = " ".join(f"{s / 1048576:.1f}" for s in shown)
+        if len(speeds) > len(shown):
+            text += f" +{len(speeds) - len(shown)}"
+        self._progress.update(self._task_id, conns=text)
