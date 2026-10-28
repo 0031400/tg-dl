@@ -138,8 +138,29 @@ uv run tgdl download 8913476869:6799 --auth-keys 3 -c 16
 3 条是最优点：每条多约 2 秒的 DH 握手，5 条时握手开销（~8s）已经吃掉收益，
 而且链路本身也接近饱和。**小文件（几十 MB 以内）不要开**，握手成本盖过收益。
 
-**auth key 会缓存到 `.tgdl/authkeys.json`**，按 DC 分开存（`{"4": ["<hex>", ...]}`），
-第二次运行就不用重新握手了（DH 约 3.4s → 复用约 1.1s，而且多条 key 是并行建立的）。
+**auth key 全部存在 `.tgdl/authkeys.json`**，主 key 和派生 key 地位完全平等——
+都只是「某个 DC 的一条授权」。`fast.session` 里**不再保留密钥**（只留实体缓存和同步游标）。
+
+```json
+{
+  "home_dc": 5,
+  "home_ip": "91.108.56.196",
+  "home_port": 443,
+  "keys": {"4": ["<hex>", "..."], "5": ["<hex>"]}
+}
+```
+
+`home_*` 只回答「没有 key 时从哪个 DC 开始连」。所以：
+
+> **换机器 / 换账号 = 替换这一个文件。** 把 `authkeys.json` 拷到另一台机器的 `.tgdl/` 下
+> 就等于登录了，不用验证码。实测把 `fast.session` 整个删掉、只留 `authkeys.json`，
+> `tgdl whoami` 和下载都照常工作。
+
+`tgdl login` 做的就是这件事：登录成功后把 key 写进 `authkeys.json`，并让 session 文件
+永远不落盘密钥（`KeylessSession` 覆写了写库逻辑，无条件写 NULL）。
+老版本升级会自动迁移：发现 `fast.session` 里还有 key 而 `authkeys.json` 没有 home，
+就把它搬过去并清掉 session 里那份。
+
 同一个文件：
 
 | 场景 | 耗时 | 速度 |
@@ -207,8 +228,9 @@ uv run tgdl download 8913476869:6799 --auth-keys 3 -c 16
 >
 > 所以 `[fast] auth key DC4：...` 这行大约 **2.1s** 出现（原来要等 5.6s）。
 
-缓存文件里是裸的 auth key，和 `.tgdl/*.session` 同等敏感（都能直接读你的消息），别外传。
-`tgdl doctor` 会按 DC 显示缓存条数（`auth key 缓存 5 条（DC4 5 条）`）；删掉这个文件即可重置。
+`authkeys.json` 是**唯一的凭据文件**，里面是裸的 auth key，和密码等价，别外传。
+`tgdl doctor` 会按 DC 显示条数和主 DC（`auth key 11 条（DC4 10 条，DC5 1 条｜主 DC5）`）；
+删掉这个文件就等于退出登录。
 
 > 限制：`exportAuthorization` 不允许导出**当前会话所在 DC** 的授权，所以文件恰好在
 > 会话自己的 DC 上时，额外 key 会创建失败并回退成单 key 下载（日志里会提示）。

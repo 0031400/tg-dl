@@ -527,12 +527,13 @@ def doctor(verbosity: int = typer.Option(1, "--verbosity")) -> None:
 
     try:
         store = fast.AuthKeyStore(cfg.authkeys_file)
-        per_dc = {dc: len(v) for dc, v in store._data.items() if v}
+        per_dc = {dc: len(v) for dc, v in store._keys.items() if v}
     except Exception:  # noqa: BLE001
-        per_dc = {}
+        store, per_dc = None, {}
     if per_dc:
         detail = "，".join(f"DC{dc} {n} 条" for dc, n in sorted(per_dc.items(), key=lambda kv: int(kv[0])))
-        table.add_row("auth key 缓存", f"{sum(per_dc.values())} 条（{detail}）")
+        home = f"｜主 DC{store.home_dc}" if store and store.home_dc else ""
+        table.add_row("auth key", f"{sum(per_dc.values())} 条（{detail}{home}）")
     else:
         table.add_row(
             "auth key 缓存",

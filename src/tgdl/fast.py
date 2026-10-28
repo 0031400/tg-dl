@@ -82,14 +82,18 @@ def check_crypto(force: bool = False) -> bool:
 
 def make_client(cfg: Config, session_index: int = 1):
     TelegramClient, _, _, _ = _telethon()
+
     api_id, api_hash = cfg.require_credentials()
     cfg.ensure_dirs()
     check_crypto()
     # Telethon 的 INFO 日志会插进进度条里，默认只留警告
     logging.getLogger("telethon").setLevel(logging.WARNING)
-    client = TelegramClient(
-        str(cfg.fast_session_at(session_index)), api_id, api_hash, device_model="tgdl"
-    )
+
+    # session 文件只当「实体缓存 + 同步游标」用，凭据一律从 authkeys.json 注入
+    session = _make_session(cfg.fast_session_at(session_index))
+    _attach_auth_key(session, AuthKeyStore(cfg.authkeys_file))
+
+    client = TelegramClient(session, api_id, api_hash, device_model="tgdl")
     client.flood_sleep_threshold = 0  # 自己处理 FLOOD_WAIT，避免全局串行等待
     return client
 
@@ -112,6 +116,7 @@ async def login(
     try:
         if await client.is_user_authorized():
             me = await client.get_me()
+            save_primary_key(cfg, client, set_home=session_index == 1)
             return f"已登录：{me.first_name or ''} @{me.username or me.id}"
         number = phone or input("手机号（含国家码，如 +8613800138000）: ").strip()
         sent = await client.send_code_request(number)
@@ -127,9 +132,14 @@ async def login(
             except errors.PhoneCodeInvalidError:
                 print("[fast] 验证码错误，请重试")
         me = await client.get_me()
+        # 主 key 写进 authkeys.json（和派生 key 同一份文件、同等地位）
+        save_primary_key(cfg, client, set_home=session_index == 1)
         return f"登录成功：{me.first_name or ''} @{me.username or me.id}"
     finally:
         await client.disconnect()
+        # 凭据只留在 authkeys.json，session 文件里抹掉
+        with contextlib.suppress(Exception):
+            client.session.auth_key = None
 
 
 async def logout(cfg: Config, session_index: int = 1) -> str:
@@ -138,7 +148,13 @@ async def logout(cfg: Config, session_index: int = 1) -> str:
     try:
         if not await client.is_user_authorized():
             return "fast 引擎当前未登录"
+        store = AuthKeyStore(cfg.authkeys_file)
+        home_dc = store.home_dc
         await client.log_out()
+        # 服务端已撤销这条授权，缓存里的 key 也要删掉
+        if home_dc:
+            for key_hex in store.keys(home_dc):
+                store.drop(home_dc, key_hex)
         return "fast 引擎已退出登录"
     finally:
         await client.disconnect()
@@ -180,31 +196,76 @@ async def _safe_disconnect(sender) -> None:
 
 
 class AuthKeyStore:
-    """把为其他 DC 生成的 auth key 落盘，下次直接复用。
+    """**所有** auth key 的唯一存放处（`.tgdl/authkeys.json`）。
 
-    DH 握手一次约 3 秒，而用存下来的 key 重连只要 ~0.02 秒。
-    注意：这个文件和 session 文件同等敏感（都是能直接读你消息的凭据），别外传。
+    主 key 和派生 key 地位完全平等——都只是「某个 DC 的一条授权」。
+    登录后主 key 也写进这里，`fast.session` 里不再保留密钥（只留实体缓存/同步游标）。
+
+    文件格式：
+
+        {
+          "home_dc": 5,
+          "home_ip": "149.154.171.5",
+          "home_port": 443,
+          "keys": {"4": ["<hex>", ...], "5": ["<hex>", ...]}
+        }
+
+    `home_*` 只回答「没有 key 时从哪个 DC 开始连」，所以**把这个文件拷到另一台机器
+    就等于登录了**，不用再走验证码。旧的扁平格式 `{"4": [...]}` 仍能读。
+
+    安全提醒：里面是裸的 auth key，和密码等价，别外传。
     """
 
     MAX_PER_DC = 12
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self._data: dict[str, list[str]] = {}
+        self._keys: dict[str, list[str]] = {}
+        self.home_dc: int | None = None
+        self.home_ip: str | None = None
+        self.home_port: int | None = None
+        self._load()
+
+    # ---- 读写 ----
+    def _load(self) -> None:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                self._data = {
-                    str(k): [str(x) for x in v] for k, v in raw.items() if isinstance(v, list)
-                }
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(raw, dict):
+            return
+        if isinstance(raw.get("keys"), dict):
+            src = raw["keys"]
+            self.home_dc = int(raw["home_dc"]) if raw.get("home_dc") else None
+            self.home_ip = str(raw["home_ip"]) if raw.get("home_ip") else None
+            self.home_port = int(raw["home_port"]) if raw.get("home_port") else None
+        else:
+            src = raw   # 老格式：扁平 {"4": [...]}
+        self._keys = {
+            str(k): [str(x) for x in v] for k, v in src.items() if isinstance(v, list)
+        }
+
+    def _flush(self) -> None:
+        data = {
+            "home_dc": self.home_dc,
+            "home_ip": self.home_ip,
+            "home_port": self.home_port,
+            "keys": {k: v for k, v in self._keys.items() if v},
+        }
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:  # noqa: BLE001
             pass
 
+    # ---- key ----
     def keys(self, dc_id: int) -> list[str]:
-        return list(self._data.get(str(dc_id), []))
+        return list(self._keys.get(str(dc_id), []))
 
-    def add(self, dc_id: int, key: bytes) -> None:
-        bucket = self._data.setdefault(str(dc_id), [])
+    def add(self, dc_id: int, key: bytes | None) -> None:
+        if not key:
+            return
+        bucket = self._keys.setdefault(str(dc_id), [])
         hexed = key.hex()
         if hexed not in bucket:
             bucket.append(hexed)
@@ -212,20 +273,91 @@ class AuthKeyStore:
             self._flush()
 
     def drop(self, dc_id: int, key_hex: str) -> None:
-        bucket = self._data.get(str(dc_id), [])
+        bucket = self._keys.get(str(dc_id), [])
         if key_hex in bucket:
             bucket.remove(key_hex)
             self._flush()
 
     def count(self) -> int:
-        return sum(len(v) for v in self._data.values())
+        return sum(len(v) for v in self._keys.values())
 
-    def _flush(self) -> None:
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
-        except Exception:  # noqa: BLE001
-            pass
+    # ---- home ----
+    def set_home(self, dc_id: int, ip: str | None, port: int | None) -> None:
+        self.home_dc = int(dc_id)
+        if ip:
+            self.home_ip = str(ip)
+        if port:
+            self.home_port = int(port)
+        self._flush()
+
+    def home(self) -> tuple[int, str, int] | None:
+        if not self.home_dc or not self.home_ip:
+            return None
+        return self.home_dc, self.home_ip, self.home_port or 443
+
+    def primary(self) -> str | None:
+        if not self.home_dc:
+            return None
+        bucket = self._keys.get(str(self.home_dc)) or []
+        return bucket[0] if bucket else None
+
+
+def _make_session(path: Path):
+    """session 文件只当「实体缓存 + 同步游标」，**永不写入 auth key**。
+
+    Telethon 的 `SQLiteSession.save()` 会把内存里的 key 落盘，所以这里覆盖
+    `_update_session_table()`，无条件写 NULL —— 凭据只存在于 authkeys.json。
+    """
+    from telethon.sessions import SQLiteSession
+
+    class KeylessSession(SQLiteSession):
+        def _update_session_table(self) -> None:
+            c = self._cursor()
+            c.execute("delete from sessions")
+            c.execute(
+                "insert into sessions values (?,?,?,?,?,?)",
+                (self._dc_id, self._server_address, self._port, None, self._takeout_id, None),
+            )
+
+    return KeylessSession(str(path))
+
+
+def _attach_auth_key(session, store: AuthKeyStore) -> None:
+    """把 auth key 从 authkeys.json 注入 session（只放内存，不写回 session 文件）。
+
+    顺便做一次老数据迁移：早期版本把 key 存在 `fast.session` 里，
+    这里发现 store 没有 home 就把 session 里的 key 搬过去。
+    """
+    from telethon.crypto import AuthKey
+
+    if store.home_dc is None:
+        old = session.auth_key
+        if old is not None and old.key and session.dc_id:
+            store.set_home(session.dc_id, session.server_address, session.port)
+            store.add(session.dc_id, old.key)
+
+    home = store.home()
+    key_hex = store.primary()
+    if not home or not key_hex:
+        return
+    dc_id, ip, port = home
+    # set_dc 会按数据库里的值重置 _auth_key（NULL → None），
+    # 所以先设 DC，再把 key 只放进内存（KeylessSession 永远不会写盘）。
+    session.set_dc(dc_id, ip, port)
+    session._auth_key = AuthKey(bytes.fromhex(key_hex))
+
+
+def save_primary_key(cfg: Config, client, *, set_home: bool = True) -> bool:
+    """把当前连接用的 key 写进 authkeys.json（登录成功后调用）。"""
+    session = client.session
+    key = session.auth_key
+    if key is None or not key.key or not session.dc_id:
+        return False
+    store = AuthKeyStore(cfg.authkeys_file)
+    if set_home:
+        store.set_home(session.dc_id, session.server_address, session.port)
+    store.add(session.dc_id, key.key)
+    return True
 
 
 async def _open_with_key(client, dc_id: int, key: bytes):
@@ -501,18 +633,25 @@ async def _build_pairs(
     need_extra = max(0, auth_keys - 1)
     cached_before = set(key_store.keys(target)) if key_store else set()
 
-    # 文件就在会话自己的 DC 上：exportAuthorization 不允许导出本 DC，
-    # 派生额外 key 必然失败（还会打一堆错），直接用会话自己的连接即可。
+    # 同 DC：exportAuthorization 不允许导出本 DC，派生不出**新** key；
+    # 但缓存里已有的 key（含登录写进去的主 key）地位平等，可以照常拿来并行。
     if dc_id is not None and dc_id == client.session.dc_id:
-        if auth_keys > 1:
+        cached_here = key_store.keys(dc_id) if key_store else []
+        usable = min(auth_keys, len(cached_here)) if cached_here else 0
+        if auth_keys > 1 and usable < auth_keys:
             print(
-                f"[fast] DC{dc_id} 是会话自身所在 DC，无法派生额外 auth key"
-                " → 只用 1 条连接（速度会低于多 key 模式）"
+                f"[fast] DC{dc_id} 是会话自身所在 DC，只能用缓存里已有的 "
+                f"{len(cached_here)} 条 key（无法现场派生）"
             )
         pairs: list = []
-        for one in clients:
-            sender = await stack.enter_async_context(_sender_for(one, dc_id))
-            pairs.append((one, sender))
+        if usable > 1:
+            for sender in await _fresh_senders(client, dc_id, usable, key_store, set()):
+                stack.push_async_callback(_safe_disconnect, sender)
+                pairs.append((client, sender))
+        if not pairs:
+            for one in clients:
+                sender = await stack.enter_async_context(_sender_for(one, dc_id))
+                pairs.append((one, sender))
         return pairs
 
     # 能不能用缓存 key 顶掉「借导出连接」那一条？
@@ -845,7 +984,10 @@ async def resolve_chat(cfg: Config, text: str) -> int:
     await client.connect()
     try:
         if not await client.is_user_authorized():
-            raise FastError("fast 引擎未登录，先执行 `tgdl login --engine fast`")
+            raise FastError(
+                "fast 引擎没有可用 auth key：执行 `tgdl login --engine fast`，"
+                "或把另一台机器的 .tgdl/authkeys.json 拷过来"
+            )
         try:
             entity = await client.get_entity(text)
         except Exception as exc:  # noqa: BLE001
@@ -862,7 +1004,10 @@ async def message_info(cfg: Config, chat_id: int, message_id: int) -> dict:
     await client.connect()
     try:
         if not await client.is_user_authorized():
-            raise FastError("fast 引擎未登录，先执行 `tgdl login --engine fast`")
+            raise FastError(
+                "fast 引擎没有可用 auth key：执行 `tgdl login --engine fast`，"
+                "或把另一台机器的 .tgdl/authkeys.json 拷过来"
+            )
         message = await _fetch_message(client, chat_id, message_id)
         location, size, name, dc_id = _location_from_message(message, types)
         media = message.media
@@ -908,7 +1053,10 @@ async def download_message(
     extra: list = []
     try:
         if not await client.is_user_authorized():
-            raise FastError("fast 引擎未登录，先执行 `tgdl login --engine fast`")
+            raise FastError(
+                "fast 引擎没有可用 auth key：执行 `tgdl login --engine fast`，"
+                "或把另一台机器的 .tgdl/authkeys.json 拷过来"
+            )
         # 多会话：每个会话一条独立 auth key，flood 预算独立，能叠加吞吐
         for index in range(2, max(1, sessions) + 1):
             helper = make_client(cfg, index)
