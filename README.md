@@ -116,6 +116,39 @@ Telegram 的 flood 限制按**账号**算。如果撞上以后还保持原并发
 并发自动从 16 降到 1 再涨回 9，下载全程没有卡顿。所以偶尔看到一两条 `FLOOD_WAIT` 是正常的
 自动降速，不是出错。
 
+### 多 auth key 叠加（`--auth-keys`）
+
+Telegram 的 flood 预算按 **auth key** 算，不是按账号。所以可以用多条独立 auth key 并行，
+把限流额度摊开。关键在于：**不需要重复登录**——从当前会话 `exportAuthorization` 拿到 token，
+再对目标 DC 做一次全新 DH 握手导入即可，每条都是独立的 key。
+
+```bash
+uv run tgdl download 8913476869:6799 --auth-keys 3 -c 16
+```
+
+同一个 189 MB 文件实测：
+
+| 配置 | 耗时 | 速度 |
+| --- | --- | --- |
+| `--engine tdlib` | 46.1s | 4.11 MiB/s |
+| `--auth-keys 1`（默认） | 41.5s | 4.57 MiB/s |
+| **`--auth-keys 3`** | **28.3s** | **6.68 MiB/s** |
+| `--auth-keys 5` | 32.4s | 5.84 MiB/s |
+
+3 条是最优点：每条多约 2 秒的 DH 握手，5 条时握手开销（~8s）已经吃掉收益，
+而且链路本身也接近饱和。**小文件（几十 MB 以内）不要开**，握手成本盖过收益。
+
+**auth key 会缓存到 `.tgdl/authkeys.json`**，第二次运行就不用重新握手了
+（DH 约 3.4s → 复用约 1.1s，而且多条 key 是并行建立的）。同一个文件：
+
+| 场景 | 耗时 | 速度 |
+| --- | --- | --- |
+| `--auth-keys 3`，首次（要 DH） | 24.5s | 7.74 MiB/s |
+| `--auth-keys 3`，key 已缓存 | **21.9s** | **8.66 MiB/s** |
+
+缓存文件里是裸的 auth key，和 `.tgdl/*.session` 同等敏感（都能直接读你的消息），别外传。
+`tgdl doctor` 会显示当前缓存了几条；删掉这个文件即可重置。
+
 ### ⚠️ 必须装 cryptg，否则前功尽弃
 
 Telethon 的 AES-IGE 加解密有三档实现：`cryptg`（C 扩展）→ `libssl` → **纯 Python 的 pyaes**。
@@ -148,7 +181,7 @@ Telethon 的 AES-IGE 加解密有三档实现：`cryptg`（C 扩展）→ `libss
 | `tgdl logout` | 退出登录并清理会话 |
 | `tgdl whoami` | 两个引擎的登录状态 |
 | `tgdl info <chat_id:message_id>` | 看文件名 / 大小 / 类型 / DC，不下载 |
-| `tgdl download <chat_id:message_id> [-o 路径] [-c 16] [--chunk 512K] [--fixed] [--engine auto\|fast\|tdlib]` | 下载 |
+| `tgdl download <chat_id:message_id> [-o 路径] [-c 16] [--chunk 512K] [--fixed] [--auth-keys 3] [--engine auto\|fast\|tdlib]` | 下载 |
 | `tgdl bench <chat_id:message_id> [-c 4,8,16,32] [--mb 64]` | 同文件对比两个引擎（`--mb` 只测前 N MB） |
 | `tgdl doctor` | 自检配置 / dll / 会话 |
 

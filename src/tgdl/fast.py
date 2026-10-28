@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
+import json
 import logging
 import os
 import time
@@ -169,6 +171,136 @@ async def _sender_for(client, dc_id: int | None):
         yield client._sender
 
 
+async def _safe_disconnect(sender) -> None:
+    with contextlib.suppress(Exception):
+        await sender.disconnect()
+
+
+class AuthKeyStore:
+    """把为其他 DC 生成的 auth key 落盘，下次直接复用。
+
+    DH 握手一次约 3 秒，而用存下来的 key 重连只要 ~0.02 秒。
+    注意：这个文件和 session 文件同等敏感（都是能直接读你消息的凭据），别外传。
+    """
+
+    MAX_PER_DC = 5
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._data: dict[str, list[str]] = {}
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self._data = {
+                    str(k): [str(x) for x in v] for k, v in raw.items() if isinstance(v, list)
+                }
+        except Exception:  # noqa: BLE001
+            pass
+
+    def keys(self, dc_id: int) -> list[str]:
+        return list(self._data.get(str(dc_id), []))
+
+    def add(self, dc_id: int, key: bytes) -> None:
+        bucket = self._data.setdefault(str(dc_id), [])
+        hexed = key.hex()
+        if hexed not in bucket:
+            bucket.append(hexed)
+            del bucket[: -self.MAX_PER_DC]
+            self._flush()
+
+    def drop(self, dc_id: int, key_hex: str) -> None:
+        bucket = self._data.get(str(dc_id), [])
+        if key_hex in bucket:
+            bucket.remove(key_hex)
+            self._flush()
+
+    def count(self) -> int:
+        return sum(len(v) for v in self._data.values())
+
+    def _flush(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _open_with_key(client, dc_id: int, key: bytes):
+    """用现成的 auth key 直连（不做 DH）。"""
+    from telethon import functions as _functions
+    from telethon.client.telegrambaseclient import LAYER
+    from telethon.crypto import AuthKey
+    from telethon.network import MTProtoSender
+    from telethon.tl.functions import InvokeWithLayerRequest
+
+    dc = await client._get_dc(dc_id)
+    sender = MTProtoSender(AuthKey(key), loggers=client._log)
+    await sender.connect(
+        client._connection(dc.ip_address, dc.port, dc_id, loggers=client._log)
+    )
+    try:
+        # initConnection 每条连接要发一次；顺手当校验，key 失效会抛错
+        init = copy.copy(client._init_request)
+        init.query = _functions.help.GetConfigRequest()
+        await sender.send(InvokeWithLayerRequest(LAYER, init))
+    except Exception:  # noqa: BLE001
+        await _safe_disconnect(sender)
+        raise
+    return sender
+
+
+async def _fresh_sender(
+    client,
+    dc_id: int | None,
+    store: "AuthKeyStore | None" = None,
+    used: set[str] | None = None,
+):
+    """得到一条**独立 auth key** 的连接。
+
+    Telegram 的 flood 预算按 auth key 计（不是按账号），所以多开几条能叠加吞吐。
+    优先复用落盘的 key（0.02s），没有再走 DH 握手（~3s）并缓存下来。
+    ``used`` 记录本次运行已经用掉的 key，避免同一个 key 被复用两次（那样就不独立了）。
+    """
+    from telethon import functions as _functions
+    from telethon.client.telegrambaseclient import LAYER
+    from telethon.network import MTProtoSender
+    from telethon.tl.functions import InvokeWithLayerRequest
+
+    target = dc_id or client.session.dc_id
+
+    if store is not None:
+        for key_hex in store.keys(target):
+            if used is not None:
+                if key_hex in used:
+                    continue  # 这条已经被别的任务占了，要的是独立 key
+                used.add(key_hex)  # 先占位（await 之前），并发任务不会抢同一条
+            try:
+                return await _open_with_key(client, target, bytes.fromhex(key_hex))
+            except Exception:  # noqa: BLE001
+                if used is not None:
+                    used.discard(key_hex)
+                store.drop(target, key_hex)  # 失效了就丢掉
+
+    dc = await client._get_dc(target)
+    sender = MTProtoSender(None, loggers=client._log)
+    await sender.connect(
+        client._connection(dc.ip_address, dc.port, target, loggers=client._log)
+    )
+    try:
+        auth = await client(_functions.auth.ExportAuthorizationRequest(target))
+        init = copy.copy(client._init_request)
+        init.query = _functions.auth.ImportAuthorizationRequest(id=auth.id, bytes=auth.bytes)
+        await sender.send(InvokeWithLayerRequest(LAYER, init))
+    except Exception:  # noqa: BLE001
+        await _safe_disconnect(sender)
+        raise
+    if store is not None and sender.auth_key is not None:
+        store.add(target, sender.auth_key.key)
+        if used is not None:
+            used.add(sender.auth_key.key.hex())
+    return sender
+
+
 async def _get_file(client, sender, location, offset: int, limit: int, *, cdn: bool) -> bytes:
     _, errors, functions, types = _telethon()
     request = functions.upload.GetFileRequest(
@@ -308,8 +440,17 @@ async def download_location(
     chunk: int = DEFAULT_CHUNK,
     retries: int = 6,
     adaptive: bool = True,
+    auth_keys: int = 1,
+    key_store: "AuthKeyStore | None" = None,
+    extra_clients: list | None = None,
     on_progress: ProgressCb | None = None,
 ) -> Path:
+    """并行下载一个文件。
+
+    ``extra_clients`` 是额外登录会话（每个都是一条独立 auth key）。
+    Telegram 的 flood 预算按 auth key 算，所以多个会话能把请求摊开、叠加吞吐；
+    ``connections`` 则是所有会话加起来的总在途请求数。
+    """
     _, errors, functions, types = _telethon()
     if size <= 0:
         raise FastError("文件大小为 0")
@@ -329,14 +470,41 @@ async def download_location(
     limiter = AdaptiveLimiter(connections, adaptive=adaptive)
     started = time.monotonic()
 
-    async with _sender_for(client, dc_id) as sender:
-        async def fetch(offset: int) -> bytes:
+    clients = [client, *(extra_clients or [])]
+    async with contextlib.AsyncExitStack() as stack:
+        # 每个会话一条（或一组）连接；请求按 worker 轮流分给各会话
+        pairs = []
+        for one in clients:
+            sender = await stack.enter_async_context(_sender_for(one, dc_id))
+            pairs.append((one, sender))
+
+        # 额外 auth key：每条是独立的 flood 预算，请求按 worker 轮流摊过去
+        if auth_keys > 1:
+            target = dc_id or client.session.dc_id
+            used: set[str] = set()
+            # 并行建立，省掉串行等 DH 的时间
+            results = await asyncio.gather(
+                *[_fresh_sender(client, target, key_store, used)
+                  for _ in range(auth_keys - 1)],
+                return_exceptions=True,
+            )
+            for item in results:
+                if isinstance(item, BaseException):
+                    print(f"[fast] 额外 auth key 创建失败：{item}（回退到 {len(pairs)} 条）")
+                    continue
+                stack.push_async_callback(_safe_disconnect, item)
+                pairs.append((client, item))
+            if len(pairs) > 1:
+                print(f"[fast] 使用 {len(pairs)} 条独立 auth key 并行下载")
+
+        async def fetch(pair, offset: int) -> bytes:
+            owner, sender = pair
             last: Exception | None = None
             for attempt in range(retries):
                 await limiter.wait_cooldown()  # 全局冷却期内不发起任何请求
                 try:
                     data = await _get_file(
-                        client, sender, location, offset, chunk, cdn=state["cdn"]
+                        owner, sender, location, offset, chunk, cdn=state["cdn"]
                     )
                     limiter.note_success()
                     return data
@@ -370,7 +538,8 @@ async def download_location(
                     await asyncio.sleep(min(2 ** attempt * 0.5, 8))
             raise FastError(f"offset {offset} 重试 {retries} 次仍失败: {last}")
 
-        async def worker() -> None:
+        async def worker(slot: int) -> None:
+            pair = pairs[slot % len(pairs)]
             handle = dest.open("r+b", buffering=0)
             try:
                 while True:
@@ -381,7 +550,7 @@ async def download_location(
                     await limiter.wait_cooldown()
                     await limiter.acquire()
                     try:
-                        data = await fetch(offset)
+                        data = await fetch(pair, offset)
                     finally:
                         await limiter.release()
                     if not data:
@@ -400,7 +569,9 @@ async def download_location(
             finally:
                 handle.close()
 
-        workers = [asyncio.create_task(worker()) for _ in range(max(1, connections))]
+        workers = [
+            asyncio.create_task(worker(i)) for i in range(max(1, connections))
+        ]
         try:
             done, pending = await asyncio.wait(workers, return_when=asyncio.FIRST_EXCEPTION)
             for task in done:
@@ -515,6 +686,24 @@ async def _fetch_message(client, chat_id: int, message_id: int):
     return message
 
 
+async def resolve_chat(cfg: Config, text: str) -> int:
+    """把 @username / t.me 链接解析成 chat_id（-100… 形式）。"""
+    from telethon import utils
+
+    client = make_client(cfg)
+    await client.connect()
+    try:
+        if not await client.is_user_authorized():
+            raise FastError("fast 引擎未登录，先执行 `tgdl login --engine fast`")
+        try:
+            entity = await client.get_entity(text)
+        except Exception as exc:  # noqa: BLE001
+            raise FastError(f"解析 {text} 失败：{exc}") from exc
+        return int(utils.get_peer_id(entity))
+    finally:
+        await client.disconnect()
+
+
 async def message_info(cfg: Config, chat_id: int, message_id: int) -> dict:
     """读取消息里的文件信息（不下载）。"""
     _, _, _, types = _telethon()
@@ -550,6 +739,8 @@ async def download_message(
     chunk: int = DEFAULT_CHUNK,
     limit: int = 0,
     adaptive: bool = True,
+    sessions: int = 1,
+    auth_keys: int = 1,
     on_progress: ProgressCb | None = None,
 ) -> tuple[Path, float, str, int]:
     """按 chat_id:message_id 下载消息里的文件。
@@ -560,9 +751,20 @@ async def download_message(
     _, errors, _, types = _telethon()
     client = make_client(cfg)
     await client.connect()
+    extra: list = []
     try:
         if not await client.is_user_authorized():
             raise FastError("fast 引擎未登录，先执行 `tgdl login --engine fast`")
+        # 多会话：每个会话一条独立 auth key，flood 预算独立，能叠加吞吐
+        for index in range(2, max(1, sessions) + 1):
+            helper = make_client(cfg, index)
+            await helper.connect()
+            if not await helper.is_user_authorized():
+                raise FastError(
+                    f"第 {index} 个会话未登录：先执行 "
+                    f"`tgdl login --engine fast --session {index}`"
+                )
+            extra.append(helper)
         message = await _fetch_message(client, chat_id, message_id)
         location, size, name, dc_id = _location_from_message(message, types)
         size = int(size)
@@ -576,7 +778,9 @@ async def download_message(
             await download_location(
                 client, location, size, target, dc_id=dc_id,
                 connections=connections, chunk=chunk,
-                adaptive=adaptive, on_progress=on_progress,
+                adaptive=adaptive, auth_keys=auth_keys,
+                key_store=AuthKeyStore(cfg.authkeys_file),
+                extra_clients=extra, on_progress=on_progress,
             )
         except errors.FileReferenceExpiredError as exc:
             raise FastError(
@@ -586,4 +790,6 @@ async def download_message(
             raise FastError(f"Telegram 返回错误: {exc}") from exc
         return target, time.monotonic() - started, name, size
     finally:
+        for helper in extra:
+            await helper.disconnect()
         await client.disconnect()

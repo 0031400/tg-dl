@@ -49,6 +49,11 @@ class Config:
             return self.data_dir / "fast"
         return self.data_dir / f"fast{index}"
 
+    @property
+    def authkeys_file(self) -> Path:
+        """缓存为其他 DC 生成的 auth key，省掉每次 ~3 秒的 DH 握手。"""
+        return self.data_dir / "authkeys.json"
+
     def require_credentials(self) -> tuple[int, str]:
         if not self.api_id or not self.api_hash:
             raise ConfigError(

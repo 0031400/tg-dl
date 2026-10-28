@@ -108,6 +108,10 @@ def _login_tdlib(cfg: Config, phone: str | None, verbosity: int) -> None:
 def login(
     engine: str = typer.Option("all", "--engine", help="tdlib | fast | all"),
     phone: Optional[str] = typer.Option(None, "--phone", help="手机号（含国家码）"),
+    session: int = typer.Option(
+        1, "--session",
+        help="fast 引擎的会话序号（1=fast，2=fast2…）。多会话可叠加吞吐",
+    ),
     verbosity: int = typer.Option(1, "--verbosity", help="TDLib 日志级别"),
 ) -> None:
     """登录（tdlib 引擎 / fast 引擎，各自维护自己的会话）。"""
@@ -125,6 +129,7 @@ def login(
                     phone=phone,
                     ask_code=lambda: typer.prompt("验证码"),
                     ask_password=lambda: typer.prompt("两步验证密码", hide_input=True),
+                    session_index=session,
                 )
             )
             console.print(f"[green]{message}[/green]")
@@ -268,6 +273,10 @@ def download(
         False, "--fixed",
         help="固定并发，不做自适应调节（撞限流只等待、不降并发）",
     ),
+    auth_keys: int = typer.Option(
+        1, "--auth-keys",
+        help="并行使用的独立 auth key 数（>1 会现场生成，绕过按 key 的限流；无需额外登录）",
+    ),
     verbosity: int = typer.Option(1, "--verbosity"),
 ) -> None:
     """下载 chat_id:message_id 指向的消息里的文件。"""
@@ -295,7 +304,8 @@ def download(
                     fast.download_message(
                         cfg, chat_id, message_id, output,
                         connections=connections, chunk=chunk_bytes,
-                        adaptive=not fixed, on_progress=bar.update,
+                        adaptive=not fixed, auth_keys=auth_keys,
+                        on_progress=bar.update,
                     )
                 )
         except fast.FastError as exc:
@@ -466,6 +476,16 @@ def doctor(verbosity: int = typer.Option(1, "--verbosity")) -> None:
     )
 
     try:
+        store = fast.AuthKeyStore(cfg.authkeys_file)
+        cached = store.count()
+    except Exception:  # noqa: BLE001
+        cached = 0
+    table.add_row(
+        "auth key 缓存",
+        f"{cached} 条" if cached else "[dim]无（首次用 --auth-keys 会自动生成）[/dim]",
+    )
+
+    try:
         with Tdlib(cfg, verbosity=verbosity) as td:
             if td.wait_ready(60):
                 table.add_row("tdlib 会话", f"[green]已登录[/green] {_user_label(td.call({'@type': 'getMe'}))}")
@@ -480,6 +500,23 @@ def doctor(verbosity: int = typer.Option(1, "--verbosity")) -> None:
         table.add_row("fast 会话", f"[red]{exc}[/red]")
 
     console.print(table)
+
+
+@app.command()
+def serve(
+    port: int = typer.Option(8765, "--port", "-p", help="监听端口"),
+    token: Optional[str] = typer.Option(
+        None, "--token", help="访问令牌；不填会自动生成并写入 .tgdl/server.token"
+    ),
+) -> None:
+    """启动本地服务，给油猴脚本用（只监听 127.0.0.1）。"""
+    cfg = _load()
+    from .server import serve as run_server
+
+    try:
+        run_server(cfg, port=port, token=token)
+    except OSError as exc:
+        _fail(f"启动失败：{exc}")
 
 
 @app.command()
