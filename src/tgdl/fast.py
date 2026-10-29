@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Callable
 
 from .config import Config, remember_dc
-from .util import to_mtproto_message_id
+from .util import to_mtproto_message_id, to_tdlib_message_id
 
 DEFAULT_CHUNK = 512 * 1024
 MAX_CHUNK = 1024 * 1024
@@ -91,7 +91,7 @@ def make_client(cfg: Config, session_index: int = 1):
 
     # session 文件只当「实体缓存 + 同步游标」用，凭据一律从 authkeys.json 注入
     session = _make_session(cfg.fast_session_at(session_index))
-    _attach_auth_key(session, AuthKeyStore(cfg.authkeys_file))
+    _attach_auth_key(session, AuthKeyStore(cfg.authkeys_file), session_index)
 
     client = TelegramClient(session, api_id, api_hash, device_model="tgdl")
     client.flood_sleep_threshold = 0  # 自己处理 FLOOD_WAIT，避免全局串行等待
@@ -106,34 +106,55 @@ async def login(
     cfg: Config,
     *,
     phone: str | None = None,
-    ask_code: Callable[[], str] | None = None,
-    ask_password: Callable[[], str] | None = None,
+    ask_code: Callable[[int], str] | None = None,
+    ask_password: Callable[[int], str] | None = None,
     session_index: int = 1,
 ) -> str:
+    """登录一个会话。
+
+    ``ask_code(attempt)`` / ``ask_password(attempt)`` 的 ``attempt`` 是第几次尝试
+    （0 表示第一次）。多会话登录时上层可以借此复用第一次的输入，
+    只有真正错了才重新问。
+    """
     _, errors, _, _ = _telethon()
     client = make_client(cfg, session_index)
     await client.connect()
     try:
         if await client.is_user_authorized():
             me = await client.get_me()
-            save_primary_key(cfg, client, set_home=session_index == 1)
+            save_primary_key(cfg, client, session_index=session_index)
             return f"已登录：{me.first_name or ''} @{me.username or me.id}"
         number = phone or input("手机号（含国家码，如 +8613800138000）: ").strip()
-        sent = await client.send_code_request(number)
-        for _ in range(5):
-            code = ask_code() if ask_code else input("验证码: ").strip()
+
+        # 连续登录多个会话时，sendCode 可能被限流，等一下就重试
+        sent = None
+        for attempt in range(4):
+            try:
+                sent = await client.send_code_request(number)
+                break
+            except errors.FloodWaitError as exc:
+                wait = int(getattr(exc, "seconds", 3)) + 1
+                print(f"[fast] 会话 #{session_index} 发码被限流，等待 {wait}s 后重试")
+                await asyncio.sleep(wait)
+        if sent is None:
+            raise FastError(f"会话 #{session_index} 发码失败（多次被限流）")
+
+        for attempt in range(5):
+            code = ask_code(attempt) if ask_code else input("验证码: ").strip()
             try:
                 await client.sign_in(number, code=code, phone_code_hash=sent.phone_code_hash)
                 break
             except errors.SessionPasswordNeededError:
-                password = ask_password() if ask_password else input("两步验证密码: ")
+                password = (
+                    ask_password(0) if ask_password else input("两步验证密码: ")
+                )
                 await client.sign_in(password=password)
                 break
             except errors.PhoneCodeInvalidError:
                 print("[fast] 验证码错误，请重试")
         me = await client.get_me()
         # 主 key 写进 authkeys.json（和派生 key 同一份文件、同等地位）
-        save_primary_key(cfg, client, set_home=session_index == 1)
+        save_primary_key(cfg, client, session_index=session_index)
         return f"登录成功：{me.first_name or ''} @{me.username or me.id}"
     finally:
         await client.disconnect()
@@ -149,12 +170,9 @@ async def logout(cfg: Config, session_index: int = 1) -> str:
         if not await client.is_user_authorized():
             return "fast 引擎当前未登录"
         store = AuthKeyStore(cfg.authkeys_file)
-        home_dc = store.home_dc
         await client.log_out()
         # 服务端已撤销这条授权，缓存里的 key 也要删掉
-        if home_dc:
-            for key_hex in store.keys(home_dc):
-                store.drop(home_dc, key_hex)
+        store.drop_session(session_index)
         return "fast 引擎已退出登录"
     finally:
         await client.disconnect()
@@ -198,20 +216,24 @@ async def _safe_disconnect(sender) -> None:
 class AuthKeyStore:
     """**所有** auth key 的唯一存放处（`.tgdl/authkeys.json`）。
 
-    主 key 和派生 key 地位完全平等——都只是「某个 DC 的一条授权」。
-    登录后主 key 也写进这里，`fast.session` 里不再保留密钥（只留实体缓存/同步游标）。
-
-    文件格式：
+    每个**登录会话**（= 一个账号）是一个独立条目，它自己的主 key 和它派生出来的
+    各 DC key 都挂在自己名下，互不串门：
 
         {
-          "home_dc": 5,
-          "home_ip": "149.154.171.5",
-          "home_port": 443,
-          "keys": {"4": ["<hex>", ...], "5": ["<hex>", ...]}
+          "home_dc": 5, "home_ip": "149.154.171.5", "home_port": 443,
+          "sessions": {
+            "1": {"dc": 5, "ip": "149.154.171.5", "port": 443,
+                  "key": "<hex>", "keys": {"4": ["<hex>", ...]}},
+            "2": {"dc": 5, "ip": "149.154.171.5", "port": 443,
+                  "key": "<hex>", "keys": {"4": ["<hex>"]}}
+          }
         }
 
-    `home_*` 只回答「没有 key 时从哪个 DC 开始连」，所以**把这个文件拷到另一台机器
-    就等于登录了**，不用再走验证码。旧的扁平格式 `{"4": [...]}` 仍能读。
+    顶层的 `home_*` 是给老版本读的兼容字段，等于 `sessions["1"]` 的 dc/ip/port。
+
+    **为什么必须按会话分**：派生 key 是「从某个账号 exportAuthorization 出来的」，
+    换一个账号导出得到的是另一条授权。全塞进一个池子里，多账号下载时就会拿 A 账号
+    的 key 去顶 B 账号的连接——看起来是 N 个账号，实际只有 1 个账号在干活。
 
     安全提醒：里面是裸的 auth key，和密码等价，别外传。
     """
@@ -220,13 +242,26 @@ class AuthKeyStore:
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self._keys: dict[str, list[str]] = {}
-        self.home_dc: int | None = None
-        self.home_ip: str | None = None
-        self.home_port: int | None = None
+        self._sessions: dict[str, dict] = {}
         self._load()
 
+    # ---- 单条会话记录 ----
+    def _rec(self, index: int = 1) -> dict:
+        return self._sessions.setdefault(
+            str(index), {"dc": None, "ip": None, "port": None, "key": None, "keys": {}}
+        )
+
     # ---- 读写 ----
+    @staticmethod
+    def _norm_keys(raw) -> dict[str, list[str]]:
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(dc): [str(x) for x in lst]
+            for dc, lst in raw.items()
+            if isinstance(lst, list) and lst
+        }
+
     def _load(self) -> None:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
@@ -234,23 +269,65 @@ class AuthKeyStore:
             return
         if not isinstance(raw, dict):
             return
-        if isinstance(raw.get("keys"), dict):
-            src = raw["keys"]
-            self.home_dc = int(raw["home_dc"]) if raw.get("home_dc") else None
-            self.home_ip = str(raw["home_ip"]) if raw.get("home_ip") else None
-            self.home_port = int(raw["home_port"]) if raw.get("home_port") else None
+
+        home_dc = int(raw["home_dc"]) if raw.get("home_dc") else None
+        home_ip = str(raw["home_ip"]) if raw.get("home_ip") else None
+        home_port = int(raw["home_port"]) if raw.get("home_port") else None
+        legacy_keys = raw.get("keys") if isinstance(raw.get("keys"), dict) else None
+        sessions = raw.get("sessions")
+        changed = False
+
+        if isinstance(sessions, dict) and sessions:
+            for key, val in sessions.items():
+                idx = str(key)
+                if isinstance(val, str):          # 老格式：{"1": "<hex>"}
+                    self._sessions[idx] = {
+                        "dc": home_dc, "ip": home_ip, "port": home_port,
+                        "key": val, "keys": {},
+                    }
+                    changed = True
+                elif isinstance(val, dict):
+                    self._sessions[idx] = {
+                        "dc": val.get("dc"),
+                        "ip": val.get("ip"),
+                        "port": val.get("port"),
+                        "key": val.get("key"),
+                        "keys": self._norm_keys(val.get("keys")),
+                    }
+            # 老格式的全局 key 池本来就是会话 1 派生出来的，归到它名下
+            if legacy_keys and "1" in self._sessions and not self._sessions["1"]["keys"]:
+                self._sessions["1"]["keys"] = self._norm_keys(legacy_keys)
+                changed = True
         else:
-            src = raw   # 老格式：扁平 {"4": [...]}
-        self._keys = {
-            str(k): [str(x) for x in v] for k, v in src.items() if isinstance(v, list)
-        }
+            # 完全没有 sessions：更老的扁平格式 {"4": [...]}
+            keys = self._norm_keys(legacy_keys if legacy_keys is not None else raw)
+            rec = {"dc": home_dc, "ip": home_ip, "port": home_port,
+                   "key": None, "keys": keys}
+            # 主 key 原来混在 keys[home_dc] 的第一条里
+            if rec["dc"] and rec["keys"].get(str(rec["dc"])):
+                rec["key"] = rec["keys"][str(rec["dc"])].pop(0)
+            self._sessions["1"] = rec
+            changed = True
+
+        if changed:
+            self._flush()
 
     def _flush(self) -> None:
+        first = self._sessions.get("1", {})
         data = {
-            "home_dc": self.home_dc,
-            "home_ip": self.home_ip,
-            "home_port": self.home_port,
-            "keys": {k: v for k, v in self._keys.items() if v},
+            "home_dc": first.get("dc"),
+            "home_ip": first.get("ip"),
+            "home_port": first.get("port"),
+            "sessions": {
+                idx: {
+                    "dc": rec.get("dc"),
+                    "ip": rec.get("ip"),
+                    "port": rec.get("port"),
+                    "key": rec.get("key"),
+                    "keys": {dc: lst for dc, lst in rec.get("keys", {}).items() if lst},
+                }
+                for idx, rec in sorted(self._sessions.items(), key=lambda kv: int(kv[0]))
+            },
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -258,47 +335,82 @@ class AuthKeyStore:
         except Exception:  # noqa: BLE001
             pass
 
-    # ---- key ----
-    def keys(self, dc_id: int) -> list[str]:
-        return list(self._keys.get(str(dc_id), []))
+    # ---- key（按会话隔离） ----
+    def keys(self, dc_id: int, index: int = 1) -> list[str]:
+        return list(self._sessions.get(str(index), {}).get("keys", {}).get(str(dc_id), []))
 
-    def add(self, dc_id: int, key: bytes | None) -> None:
+    def add(self, dc_id: int, key: bytes | None, index: int = 1) -> None:
         if not key:
             return
-        bucket = self._keys.setdefault(str(dc_id), [])
+        bucket = self._rec(index)["keys"].setdefault(str(dc_id), [])
         hexed = key.hex()
         if hexed not in bucket:
             bucket.append(hexed)
             del bucket[: -self.MAX_PER_DC]
             self._flush()
 
-    def drop(self, dc_id: int, key_hex: str) -> None:
-        bucket = self._keys.get(str(dc_id), [])
+    def drop(self, dc_id: int, key_hex: str, index: int = 1) -> None:
+        bucket = self._sessions.get(str(index), {}).get("keys", {}).get(str(dc_id), [])
         if key_hex in bucket:
             bucket.remove(key_hex)
             self._flush()
 
     def count(self) -> int:
-        return sum(len(v) for v in self._keys.values())
+        return sum(len(lst) for rec in self._sessions.values() for lst in rec["keys"].values())
 
-    # ---- home ----
-    def set_home(self, dc_id: int, ip: str | None, port: int | None) -> None:
-        self.home_dc = int(dc_id)
+    def per_dc_counts(self) -> dict[int, int]:
+        """所有会话加起来的「每个 DC 有多少条 key」。"""
+        out: dict[int, int] = {}
+        for rec in self._sessions.values():
+            for dc, lst in rec["keys"].items():
+                out[int(dc)] = out.get(int(dc), 0) + len(lst)
+        return out
+
+    # ---- home（每个会话自己的入口） ----
+    def set_home(self, dc_id: int, ip: str | None, port: int | None,
+                 index: int = 1) -> None:
+        rec = self._rec(index)
+        rec["dc"] = int(dc_id)
         if ip:
-            self.home_ip = str(ip)
+            rec["ip"] = str(ip)
         if port:
-            self.home_port = int(port)
+            rec["port"] = int(port)
         self._flush()
 
-    def home(self) -> tuple[int, str, int] | None:
-        if not self.home_dc or not self.home_ip:
+    def home(self, index: int = 1) -> tuple[int, str, int] | None:
+        rec = self._sessions.get(str(index)) or {}
+        if not rec.get("dc") or not rec.get("ip"):
             return None
-        return self.home_dc, self.home_ip, self.home_port or 443
+        return int(rec["dc"]), str(rec["ip"]), rec.get("port") or 443
 
-    def primary(self) -> str | None:
-        if not self.home_dc:
+    @property
+    def home_dc(self) -> int | None:
+        """会话 1 的主 DC（给 `tgdl doctor` 之类的展示用）。"""
+        return (self._sessions.get("1") or {}).get("dc")
+
+    # ---- 会话主 key ----
+    def session_key(self, index: int = 1) -> str | None:
+        """第 index 个登录会话的 key（1=fast，2=fast2…）。"""
+        return (self._sessions.get(str(index)) or {}).get("key")
+
+    def set_session_key(self, index: int, key: bytes | None) -> None:
+        if not key:
+            return
+        self._rec(index)["key"] = key.hex()
+        self._flush()
+
+    def drop_session(self, index: int) -> None:
+        if self._sessions.pop(str(index), None) is not None:
+            self._flush()
+
+    def session_indices(self) -> list[int]:
+        return sorted(int(i) for i in self._sessions)
+
+    def primary(self, index: int = 1) -> str | None:
+        rec = self._sessions.get(str(index)) or {}
+        if not rec.get("dc"):
             return None
-        bucket = self._keys.get(str(self.home_dc)) or []
+        bucket = rec["keys"].get(str(rec["dc"])) or []
         return bucket[0] if bucket else None
 
 
@@ -322,22 +434,32 @@ def _make_session(path: Path):
     return KeylessSession(str(path))
 
 
-def _attach_auth_key(session, store: AuthKeyStore) -> None:
+def _attach_auth_key(session, store: AuthKeyStore, index: int = 1) -> None:
     """把 auth key 从 authkeys.json 注入 session（只放内存，不写回 session 文件）。
 
-    顺便做一次老数据迁移：早期版本把 key 存在 `fast.session` 里，
-    这里发现 store 没有 home 就把 session 里的 key 搬过去。
+    顺便做两次数据自愈：
+    1. 早期版本把 key 存在 `fast.session` 里 —— store 里没有就把 session 的搬过去；
+    2. store 里有 key 却没有入口地址（登录时漏写，`sessions.3` 曾经就是这样）——
+       用 session 文件里记着的 dc/ip 补回去，否则这条会话永远「未登录」。
     """
     from telethon.crypto import AuthKey
 
-    if store.home_dc is None:
+    if index == 1 and store.home(1) is None:
         old = session.auth_key
         if old is not None and old.key and session.dc_id:
-            store.set_home(session.dc_id, session.server_address, session.port)
-            store.add(session.dc_id, old.key)
+            store.set_home(session.dc_id, session.server_address, session.port, index=1)
+            store.set_session_key(1, old.key)
 
-    home = store.home()
-    key_hex = store.primary()
+    if (
+        store.home(index) is None
+        and store.session_key(index)
+        and session.dc_id
+        and session.server_address
+    ):
+        store.set_home(session.dc_id, session.server_address, session.port, index=index)
+
+    home = store.home(index)
+    key_hex = store.session_key(index)
     if not home or not key_hex:
         return
     dc_id, ip, port = home
@@ -347,16 +469,22 @@ def _attach_auth_key(session, store: AuthKeyStore) -> None:
     session._auth_key = AuthKey(bytes.fromhex(key_hex))
 
 
-def save_primary_key(cfg: Config, client, *, set_home: bool = True) -> bool:
-    """把当前连接用的 key 写进 authkeys.json（登录成功后调用）。"""
+def save_primary_key(cfg: Config, client, *, session_index: int = 1) -> bool:
+    """把当前连接用的 key 写进 authkeys.json（登录成功后调用）。
+
+    每个会话一条记录：主 key 记在 `sessions.N.key`，它自己派生出来的各 DC key
+    记在 `sessions.N.keys.DCx`。不同账号之间不会互相污染。
+    """
     session = client.session
     key = session.auth_key
     if key is None or not key.key or not session.dc_id:
         return False
     store = AuthKeyStore(cfg.authkeys_file)
-    if set_home:
-        store.set_home(session.dc_id, session.server_address, session.port)
-    store.add(session.dc_id, key.key)
+    # 每个会话都要记自己的入口地址（以前只给会话 1 记，导致 2/3 号会话
+    # 下次连不上——`home(index)` 为空就直接放弃注入 key）
+    store.set_home(session.dc_id, session.server_address, session.port,
+                   index=session_index)
+    store.set_session_key(session_index, key.key)
     return True
 
 
@@ -408,8 +536,9 @@ async def _fresh_senders(
     count: int,
     store: "AuthKeyStore | None" = None,
     used: set[str] | None = None,
+    index: int = 1,
 ) -> list:
-    """批量拿 ``count`` 条**独立 auth key** 连接。
+    """批量拿 ``count`` 条**独立 auth key** 连接（只用 ``index`` 这个会话自己的 key）。
 
     两个关键约束（都是实测出来的）：
 
@@ -433,7 +562,7 @@ async def _fresh_senders(
 
     # 1) 缓存命中直接连（不做 DH）
     if store is not None:
-        for key_hex in store.keys(dc_id):
+        for key_hex in store.keys(dc_id, index):
             if pending <= 0:
                 break
             if used is not None:
@@ -442,10 +571,21 @@ async def _fresh_senders(
                 used.add(key_hex)   # 先占位，别被并发的另一批抢走
             try:
                 sender = await _open_with_key(client, dc_id, bytes.fromhex(key_hex))
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 if used is not None:
                     used.discard(key_hex)
-                store.drop(dc_id, key_hex)   # 失效就丢掉
+                # 只有「这条 key 真的作废」才删。flood / 网络抖动绝不能删——
+                # 一次限流就能把辛苦攒的 key 池清空（实测从 12 条掉到 3 条）。
+                name = type(exc).__name__
+                dead = "AUTH_KEY" in str(exc).upper() or "AuthKeyUnregistered" in name \
+                    or "AuthKeyDuplicated" in name
+                if dead:
+                    store.drop(dc_id, key_hex, index)
+                else:
+                    print(
+                        f"[fast] 会话 {index}：key {key_hex[:8]} 这次连不上"
+                        f"（{name}），先留着不删"
+                    )
                 continue
             out.append(sender)
             pending -= 1
@@ -483,7 +623,7 @@ async def _fresh_senders(
             print(f"[fast] auth key 创建失败：{type(exc).__name__}: {str(exc)[:80]}")
             continue
         if store is not None and sender.auth_key is not None:
-            store.add(dc_id, sender.auth_key.key)
+            store.add(dc_id, sender.auth_key.key, index)
             if used is not None:
                 used.add(sender.auth_key.key.hex())
         out.append(sender)
@@ -498,25 +638,44 @@ def _key_tag(sender) -> str:
 
 
 def _report_per_conn(pairs: list, per_conn: dict, elapsed: float, workers: int) -> None:
-    """打印每条连接实际搬了多少字节 —— 用来验证多 key 到底有没有生效。"""
+    """打印每条连接实际搬了多少字节 —— 用来验证多 key / 多账号到底有没有生效。"""
     total = sum(v.get("total", 0) for v in per_conn.values()) or 1
+    # 多个登录会话时标出每条连接属于哪个账号，否则看不出账号之间是否均衡
+    accounts: dict[int, int] = {}
+    for owner, _ in pairs:
+        accounts.setdefault(id(owner), len(accounts) + 1)
+    multi = len(accounts) > 1
     print(
-        f"[fast] 每条连接的实际用量（{len(pairs)} 条连接，"
+        f"[fast] 每条连接的实际用量（{len(pairs)} 条连接"
+        f"{f'，{len(accounts)} 个账号' if multi else ''}，"
         f"每条 {workers} 个在途，共 {total / 1048576:.1f} MB / {elapsed:.2f}s）"
     )
-    for idx, (_owner, sender) in enumerate(pairs):
+    for idx, (owner, sender) in enumerate(pairs):
         st = per_conn.get(idx, {"window": 0, "total": 0, "reqs": 0})
         moved = st.get("total", 0)
         share = moved / total * 100
         speed = moved / elapsed / 1048576 if elapsed > 0 else 0
         tag = _key_tag(sender)
+        who = f"账号{accounts[id(owner)]}  " if multi else ""
         if moved == 0:
-            print(f"  #{idx + 1}  key={tag}  未使用（0 请求）")
+            print(f"  #{idx + 1}  {who}key={tag}  未使用（0 请求）")
         else:
             print(
-                f"  #{idx + 1}  key={tag}  {moved / 1048576:8.1f} MB  "
+                f"  #{idx + 1}  {who}key={tag}  {moved / 1048576:8.1f} MB  "
                 f"{share:5.1f}%  {speed:6.2f} MB/s  {st['reqs']:4d} 请求"
             )
+    if multi:
+        per_account: dict[int, int] = {}
+        for idx, (owner, _) in enumerate(pairs):
+            per_account[accounts[id(owner)]] = (
+                per_account.get(accounts[id(owner)], 0)
+                + per_conn.get(idx, {}).get("total", 0)
+            )
+        detail = "，".join(
+            f"账号{a} {b / 1048576:.1f} MB（{b / total * 100:.0f}%）"
+            for a, b in sorted(per_account.items())
+        )
+        print(f"[fast] 按账号汇总：{detail}")
 
 
 async def _get_file(client, sender, location, offset: int, limit: int, *, cdn: bool) -> bytes:
@@ -649,6 +808,76 @@ class AdaptiveLimiter:
 # 连接池构建
 # --------------------------------------------------------------------------- #
 
+async def _pairs_for_session(
+    one,
+    index: int,
+    target: int,
+    dc_id: int | None,
+    want: int,
+    key_store: "AuthKeyStore | None",
+    stack,
+) -> list:
+    """给**一个会话**建 ``want`` 条到 target DC 的连接，只用它自己的 key。
+
+    每个会话是一个独立账号，派生 key 是「从它自己 exportAuthorization 出来的」，
+    所以绝不能跨账号借用——那样看起来是 N 个账号，实际只有 1 个在干活。
+    """
+    cached = key_store.keys(target, index) if key_store else []
+    own_dc = one.session.dc_id
+
+    # 同 DC：exportAuthorization 不允许导出本 DC，派生不出**新** key，
+    # 只能用它自己缓存里已有的（含登录时写进去的主 key）。
+    if dc_id is not None and dc_id == own_dc:
+        usable = min(want, len(cached)) if cached else 0
+        if want > 1 and usable < want:
+            print(
+                f"[fast] 会话 {index}：DC{dc_id} 就是它自己的 DC，只能用它缓存里的 "
+                f"{len(cached)} 条 key（无法现场派生）"
+            )
+        out: list = []
+        if usable:
+            for sender in await _fresh_senders(one, dc_id, usable, key_store, set(), index):
+                stack.push_async_callback(_safe_disconnect, sender)
+                out.append((one, sender))
+        if not out:
+            out.append((one, await stack.enter_async_context(_sender_for(one, dc_id))))
+        return out
+
+    # 只要一条、又没有缓存 → 直接用会话自己的连接，省掉一次 DH + export（约 4s）
+    if want <= 1 and not cached:
+        sender = await stack.enter_async_context(_sender_for(one, dc_id))
+        # 借来的导出连接顺手存进**这个账号自己**的池子，下次就不用再 export
+        if key_store is not None and dc_id is not None and dc_id != own_dc:
+            key = getattr(sender, "auth_key", None)
+            if key is not None and getattr(key, "key", None):
+                key_store.add(dc_id, key.key, index)
+        return [(one, sender)]
+
+    if want > 1:
+        if not cached:
+            print(f"[fast] 会话 {index}：需要 {want} 条 DC{target} key → 全部现场生成")
+        elif len(cached) >= want:
+            print(
+                f"[fast] 会话 {index}：DC{target} 缓存 {len(cached)} 条，需要 {want} 条 "
+                f"→ 全部复用，免 DH 握手"
+            )
+        else:
+            print(
+                f"[fast] 会话 {index}：DC{target} 缓存 {len(cached)} 条，需要 {want} 条 "
+                f"→ 复用 {len(cached)} 条，新生成 {want - len(cached)} 条"
+            )
+
+    senders = await _fresh_senders(one, target, want, key_store, set(), index)
+    if not senders:
+        # 一条都没建起来 → 退回会话自己的连接，至少别让这个会话缺席
+        senders = [await stack.enter_async_context(_sender_for(one, dc_id))]
+    out = []
+    for sender in senders:
+        stack.push_async_callback(_safe_disconnect, sender)
+        out.append((one, sender))
+    return out
+
+
 async def _build_pairs(
     client,
     clients: list,
@@ -658,88 +887,70 @@ async def _build_pairs(
     key_store: "AuthKeyStore | None",
     stack,
 ) -> list:
-    """建一组可并行的 (client, sender)。优先用缓存 auth key，不做多余 DH。"""
-    need_extra = max(0, auth_keys - 1)
-    cached_before = set(key_store.keys(target)) if key_store else set()
+    """建一组可并行的 (client, sender)。
 
-    # 同 DC：exportAuthorization 不允许导出本 DC，派生不出**新** key；
-    # 但缓存里已有的 key（含登录写进去的主 key）地位平等，可以照常拿来并行。
-    if dc_id is not None and dc_id == client.session.dc_id:
-        cached_here = key_store.keys(dc_id) if key_store else []
-        usable = min(auth_keys, len(cached_here)) if cached_here else 0
-        if auth_keys > 1 and usable < auth_keys:
-            print(
-                f"[fast] DC{dc_id} 是会话自身所在 DC，只能用缓存里已有的 "
-                f"{len(cached_here)} 条 key（无法现场派生）"
-            )
-        pairs: list = []
-        if usable > 1:
-            for sender in await _fresh_senders(client, dc_id, usable, key_store, set()):
-                stack.push_async_callback(_safe_disconnect, sender)
-                pairs.append((client, sender))
-        if not pairs:
-            for one in clients:
-                sender = await stack.enter_async_context(_sender_for(one, dc_id))
-                pairs.append((one, sender))
-        return pairs
-
-    # 能不能用缓存 key 顶掉「借导出连接」那一条？
-    # 借导出连接本身要做一次全新 DH（实测 ~3.4s），而缓存 key 直连只要 ~1.1s，
-    # 所以只要缓存里有货、且文件在别的 DC（导出授权只对非本 DC 有效），就优先用缓存。
-    cache_primary = (
-        key_store is not None
-        and bool(cached_before)
-        and len(clients) == 1
-        and dc_id is not None
-        and dc_id != client.session.dc_id
-    )
-    slots = auth_keys if cache_primary else need_extra
-
-    # 预检信息必须在任何慢操作（借导出连接 / DH 握手）之前打印出来
-    if slots > 0:
-        if key_store is None:
-            print(f"[fast] 需要 {slots} 条 auth key（未启用缓存，全部现场生成）")
-        elif len(cached_before) >= slots:
-            print(
-                f"[fast] auth key DC{target}：缓存 {len(cached_before)} 条，"
-                f"需要 {slots} 条 → 全部复用，免 DH 握手"
-            )
-        else:
-            print(
-                f"[fast] auth key DC{target}：缓存 {len(cached_before)} 条，"
-                f"需要 {slots} 条 → 复用 {len(cached_before)} 条，"
-                f"新生成 {slots - len(cached_before)} 条"
-            )
-
+    ``auth_keys`` 是**每个会话**要几条连接，总连接数 = 会话数 × auth_keys。
+    每个会话只从自己的 key 池里取，账号之间不串。
+    """
     pairs: list = []
-    if slots > 0:
-        used: set[str] = set()
-        for sender in await _fresh_senders(client, target, slots, key_store, used):
-            stack.push_async_callback(_safe_disconnect, sender)
-            pairs.append((client, sender))
-
-    # 一条都没建起来（或本来就不走缓存）→ 退回会话自己的连接
-    if not pairs:
-        for one in clients:
-            sender = await stack.enter_async_context(_sender_for(one, dc_id))
-            pairs.append((one, sender))
-    elif len(clients) > 1:
-        # 多登录会话：把它们各自的连接也加进来一起摊请求
-        for one in clients[1:]:
-            sender = await stack.enter_async_context(_sender_for(one, dc_id))
-            pairs.append((one, sender))
-
-    if len(pairs) > 1 and key_store is not None:
-        cached_after = set(key_store.keys(target))
-        fresh_count = len(cached_after - cached_before)
-        print(
-            f"[fast] 使用 {len(pairs)} 条独立 auth key 并行下载"
-            f"（复用 {len(pairs) - fresh_count} 条缓存，新生成 {fresh_count} 条，"
-            f"DC{target} 现有 {len(cached_after)} 条）"
+    for i, one in enumerate(clients):
+        pairs.extend(
+            await _pairs_for_session(one, i + 1, target, dc_id, auth_keys, key_store, stack)
         )
-    elif len(pairs) > 1:
-        print(f"[fast] 使用 {len(pairs)} 条独立 auth key 并行下载")
+
+    if len(pairs) > 1:
+        per_session = len(pairs) / max(1, len(clients))
+        who = f"{len(clients)} 个账号" if len(clients) > 1 else "1 个账号"
+        print(
+            f"[fast] {who} / {len(pairs)} 条连接并行下载"
+            f"（每个账号约 {per_session:.0f} 条）"
+        )
     return pairs
+
+
+# --------------------------------------------------------------------------- #
+# 首发错峰（照抄 TDLib 的 DelayDispatcher）
+# --------------------------------------------------------------------------- #
+
+class Stagger:
+    """把开局的请求错开发出去。
+
+    TDLib 的 ``FileLoader`` 在 ``need_delay`` 时会建一个 ``DelayDispatcher``，
+    每个分片发出前都过一道，间隔从 50ms 起按 0.8 衰减，下限 3ms
+    （``FileLoader.cpp:140``、``FileLoader.cpp:229``）。
+
+    目的不是限速，而是让服务端看到的是一条**斜坡**，而不是几十个查询在同一毫秒
+    砸过去的尖峰——尖峰是最容易换来 FLOOD_WAIT 的形态。
+
+    这里用「绝对时刻 + 小锁」实现：拿锁只算出该请求应该在哪一刻发出，睡眠在锁外，
+    所以不会把 worker 串行化，只是把首发那一下摊开。
+    """
+
+    def __init__(self, *, first: float = 0.05, factor: float = 0.8,
+                 floor: float = 0.003, count: int = 32):
+        self._next = float(first)
+        self._factor = float(factor)
+        self._floor = float(floor)
+        self._left = max(0, int(count))
+        self._at = 0.0
+        self._lock = asyncio.Lock()
+        self.total = 0.0        # 累计被摊开的时间，跑完可以打出来
+
+    async def wait(self) -> float:
+        async with self._lock:
+            if self._left <= 0:
+                return 0.0
+            delay = self._next
+            self._left -= 1
+            self._next = max(self._next * self._factor, self._floor)
+            now = asyncio.get_running_loop().time()
+            self._at = max(self._at, now) + delay
+            target = self._at
+            self.total += delay
+        gap = target - asyncio.get_running_loop().time()
+        if gap > 0:
+            await asyncio.sleep(gap)
+        return delay
 
 
 # --------------------------------------------------------------------------- #
@@ -762,7 +973,10 @@ async def download_location(
     on_chunk: Callable[[int, int], None] | None = None,
     senders: list | None = None,
     on_conns: Callable[[list[float]], None] | None = None,
+    on_ready: Callable[[], None] | None = None,
     on_progress: ProgressCb | None = None,
+    stagger: bool = False,
+    locations: dict[int, object] | None = None,
 ) -> Path:
     """并行下载一个文件。
 
@@ -777,11 +991,12 @@ async def download_location(
     if size <= 0:
         raise FastError("文件大小为 0")
     requested_keys = auth_keys
-    total_inflight = max(1, auth_keys) * max(1, connections)
+    total_inflight = max(1, auth_keys) * max(1, connections) * (1 + len(extra_clients or []))
     if total_inflight > 32:
         print(
-            f"[fast] 注意：{auth_keys} 条连接 × 每条 {connections} 个在途 = "
-            f"{total_inflight} 个并发请求，很容易触发 FLOOD_WAIT（建议总数 ≤ 32）"
+            f"[fast] 注意：{1 + len(extra_clients or [])} 个账号 × {auth_keys} 条连接 "
+            f"× 每条 {connections} 个在途 = {total_inflight} 个并发请求，"
+            f"很容易触发 FLOOD_WAIT（建议总数 ≤ 32）"
         )
     chunk = max(ALIGN, min(chunk, MAX_CHUNK) // ALIGN * ALIGN)
     dest = Path(dest)
@@ -830,6 +1045,8 @@ async def download_location(
 
     clients = [client, *(extra_clients or [])]
     target = dc_id or client.session.dc_id
+    # 连接 -> 它属于第几个登录会话（出错时用来定位该删谁的 key）
+    session_index_of = {id(c): i + 1 for i, c in enumerate(clients)}
 
     async with contextlib.AsyncExitStack() as stack:
         if senders is not None:
@@ -840,9 +1057,13 @@ async def download_location(
                 client, clients, target, dc_id, auth_keys, key_store, stack
             )
         pairs_ref[:] = pairs
+        if on_ready is not None:
+            on_ready()          # 连接全部就绪、即将开始传输
 
         # 每条连接一个独立的限流器：并发额度、flood 冷却都是它自己的
         limiters = [AdaptiveLimiter(connections, adaptive=adaptive) for _ in pairs]
+        # 首发错峰：count 正好覆盖开局那一批 worker，摊完就彻底关掉，不拖累稳态
+        gate = Stagger(count=len(pairs) * max(1, connections)) if stagger else None
         for i in range(len(pairs)):
             per_conn[i] = {"window": 0, "total": 0, "reqs": 0}
         tick_last[0] = time.monotonic()
@@ -850,12 +1071,16 @@ async def download_location(
         async def fetch(idx: int, offset: int) -> bytes:
             lim = limiters[idx]
             owner, sender = pairs[idx]
+            # 每个账号用自己的 file_reference（跨账号复用会 FILE_REFERENCE_INVALID）
+            loc = (locations or {}).get(id(owner), location)
             last: Exception | None = None
             for attempt in range(retries):
                 await lim.wait_cooldown()      # 只有这条连接会被卡住
+                if gate is not None:
+                    await gate.wait()          # 开局那一批按 50ms→3ms 摊开
                 try:
                     data = await _get_file(
-                        owner, sender, location, offset, chunk, cdn=state["cdn"]
+                        owner, sender, loc, offset, chunk, cdn=state["cdn"]
                     )
                     lim.note_success()
                     return data
@@ -863,6 +1088,15 @@ async def download_location(
                     state["cdn"] = False  # 退回非 CDN 直连，下一轮重试
                     last = FastError("服务器要求走 CDN，已切换为直连重试")
                 except errors.FileReferenceExpiredError as exc:
+                    # 这条 key 多半不属于这个账号（早期全局 key 池迁移过来的残留）。
+                    # 顺手从本会话的池子里剔掉，免得下次再撞同一条。
+                    raw = getattr(getattr(sender, "auth_key", None), "key", None)
+                    if key_store is not None and raw:
+                        key_store.drop(target, raw.hex(), session_index_of.get(id(owner), 1))
+                        print(
+                            f"[fast] 会话 {session_index_of.get(id(owner), 1)} 的 key "
+                            f"{raw.hex()[:8]} 读不了这条消息，已从池子里剔除"
+                        )
                     raise FastError(
                         "file_reference 已过期或无效。重新执行一次命令即可"
                         "（每次都会从消息里取最新的 file_reference）。"
@@ -964,6 +1198,8 @@ async def download_location(
     elapsed = time.monotonic() - started
     if len(pairs) > 1 or requested_keys > 1:
         _report_per_conn(pairs, per_conn, elapsed, connections)
+    if gate is not None:
+        print(f"[fast] 首发错峰：用 {gate.total * 1000:.0f}ms 把开局请求摊开")
     total_floods = sum(l.floods for l in limiters)
     if total_floods:
         detail = "，".join(
@@ -1028,8 +1264,55 @@ def _location_from_message(message, types) -> tuple[object, int, str, int | None
 
 
 
-async def _resolve_entity(client, chat_id: int):
-    """把 chat_id 解析成 InputPeer；缓存里没有就扫一遍 dialogs 再试。"""
+async def _album_candidates(client, chat_id: int, message_id: int,
+                            username: str | None = None) -> list[dict]:
+    """把这条消息（以及它所在相册的其它条目）展开成候选文件列表。
+
+    一条相册（media group）在服务端是**多条独立消息**，共享一个 ``grouped_id``：
+    比如 114 是封面图（16 KB）、115 是正片（208 MB）。只给一个 id 时没法知道
+    用户想要哪一个，所以这里全展开，由调用方按序号或体积挑。
+
+    返回按消息 id 升序（= 相册里的显示顺序），每项含
+    ``message_id``（TDLib 形式）/ ``location`` / ``size`` / ``name`` / ``dc_id``。
+    """
+    _, _, _, types = _telethon()
+    message = await _fetch_message(client, chat_id, message_id, username=username)
+    group = getattr(message, "grouped_id", None)
+
+    msgs = {message.id: message}
+    if group:
+        entity = await _resolve_entity(client, chat_id, username=username)
+        base = message.id
+        ids = [i for i in range(max(1, base - 10), base + 11) if i != base]
+        if ids:
+            for item in await client.get_messages(entity, ids=ids):
+                if item is not None and getattr(item, "grouped_id", None) == group:
+                    msgs.setdefault(item.id, item)
+
+    out: list[dict] = []
+    for mid in sorted(msgs):
+        try:
+            location, size, name, dc_id = _location_from_message(msgs[mid], types)
+        except FastError:
+            continue          # 纯文字 / 不支持的类型，跳过
+        out.append({
+            "message_id": to_tdlib_message_id(mid),
+            "location": location,
+            "size": int(size),
+            "name": name,
+            "dc_id": dc_id,
+        })
+    return out
+
+
+async def _resolve_entity(client, chat_id: int, username: str | None = None):
+    """把 chat_id 解析成 InputPeer；缓存里没有就扫一遍 dialogs 再试。
+
+    ``username`` 是给**公开频道**兜底的：一个账号没订阅某个公开频道时，
+    手里只有数字 id 是解析不出 access_hash 的（Telethon 会 ValueError），
+    但只要知道 @username 就能解析出来——所以多账号下载时由会话 1 把
+    username 传下去，其它账号就不用先加入频道。
+    """
     from telethon import utils
 
     peer = utils.get_peer(chat_id)
@@ -1043,15 +1326,23 @@ async def _resolve_entity(client, chat_id: int):
     try:
         return await client.get_input_entity(peer)
     except ValueError as exc:
+        if username:
+            name = username if username.startswith("@") else "@" + username
+            try:
+                # Telethon 只有带 @ 才会当成 username 去 ResolveUsername
+                return await client.get_input_entity(name)
+            except Exception:  # noqa: BLE001
+                pass
         raise FastError(
             f"找不到 chat_id={chat_id}。请确认这个账号在该会话里，"
             "并且最近打开过（需要先同步一次会话列表）。"
         ) from exc
 
 
-async def _fetch_message(client, chat_id: int, message_id: int):
+async def _fetch_message(client, chat_id: int, message_id: int,
+                         username: str | None = None):
     message_id = to_mtproto_message_id(message_id)
-    entity = await _resolve_entity(client, chat_id)
+    entity = await _resolve_entity(client, chat_id, username=username)
     try:
         message = await client.get_messages(entity, ids=message_id)
     except Exception as exc:  # noqa: BLE001
@@ -1129,24 +1420,71 @@ async def download_message(
     on_chunk: Callable[[int, int], None] | None = None,
     on_info: Callable[[str, int], None] | None = None,
     on_conns: Callable[[list[float]], None] | None = None,
+    on_ready: Callable[[], None] | None = None,
     on_progress: ProgressCb | None = None,
+    stagger: bool = False,
+    pick: int = 0,
 ) -> tuple[Path, float, str, int]:
     """按 chat_id:message_id 下载消息里的文件。
 
     每次都从消息里现取 location，所以不存在 file_reference 过期的问题。
     ``limit`` 不为 0 时只下载前 limit 字节（benchmark 用）。
+
+    ``pick`` 用来处理**相册**（一条消息里挂多个文件）：1 表示相册里的第 1 个，
+    不填（0）就自动挑体积最大的那个。
     """
     _, errors, _, types = _telethon()
     client = make_client(cfg)
     await client.connect()
     extra: list = []
+    locations: dict[int, object] = {}
     try:
         if not await client.is_user_authorized():
             raise FastError(
                 "fast 引擎没有可用 auth key：执行 `tgdl login --engine fast`，"
                 "或把另一台机器的 .tgdl/authkeys.json 拷过来"
             )
-        # 多会话：每个会话一条独立 auth key，flood 预算独立，能叠加吞吐
+        # 相册可能挂多个文件（封面图 + 正片），全展开后再挑
+        candidates = await _album_candidates(client, chat_id, message_id)
+        if not candidates:
+            raise FastError("这条消息里没有可下载的媒体文件")
+        if len(candidates) > 1:
+            print(f"[fast] 这条消息是相册，共 {len(candidates)} 个文件：")
+            for i, cand in enumerate(candidates, 1):
+                print(
+                    f"  {i}. {cand['name']}  {cand['size'] / 1048576:.1f} MB  "
+                    f"DC{cand['dc_id']}  {cand['message_id']}"
+                )
+        if pick:
+            if pick < 1 or pick > len(candidates):
+                raise FastError(
+                    f"--pick {pick} 超出范围：这条消息只有 {len(candidates)} 个文件"
+                )
+            chosen = candidates[pick - 1]
+            print(f"[fast] 按 --pick 选第 {pick} 个：{chosen['name']}")
+        else:
+            chosen = max(candidates, key=lambda c: c["size"])
+            if len(candidates) > 1:
+                print(f"[fast] 没指定 --pick，自动选最大的：{chosen['name']}")
+
+        location = chosen["location"]
+        size = chosen["size"]
+        name = chosen["name"]
+        dc_id = chosen["dc_id"]
+        locations[id(client)] = location
+
+        # 公开频道的 @username：给没订阅这个频道的账号兜底解析用
+        public_username = None
+        try:
+            from telethon import utils as _utils
+
+            ent = await client.get_entity(_utils.get_peer(chat_id))
+            public_username = getattr(ent, "username", None)
+        except Exception:  # noqa: BLE001
+            public_username = None
+
+        # 多账号：每个账号必须**自己**取一次消息。file_reference 是账号作用域的，
+        # 拿 A 账号的 file_reference 给 B 账号用，服务端直接回 FILE_REFERENCE_INVALID。
         for index in range(2, max(1, sessions) + 1):
             helper = make_client(cfg, index)
             await helper.connect()
@@ -1155,9 +1493,26 @@ async def download_message(
                     f"第 {index} 个会话未登录：先执行 "
                     f"`tgdl login --engine fast --session {index}`"
                 )
+            try:
+                own_message = await _fetch_message(
+                    helper, chat_id, chosen["message_id"], username=public_username
+                )
+                own_location, own_size, _, _ = _location_from_message(own_message, types)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[fast] 会话 {index} 取不到这条消息"
+                    f"（{type(exc).__name__}），跳过这个账号"
+                )
+                await helper.disconnect()
+                continue
+            if int(own_size) != int(size):
+                print(
+                    f"[fast] 会话 {index} 看到的大小是 {int(own_size)}，"
+                    f"和会话 1 的 {int(size)} 不一致，按会话 1 的算"
+                )
+            locations[id(helper)] = own_location
             extra.append(helper)
-        message = await _fetch_message(client, chat_id, message_id)
-        location, size, name, dc_id = _location_from_message(message, types)
+
         remember_dc(cfg, session_dc=client.session.dc_id, pool_dc=dc_id)
         size = int(size)
         if limit:
@@ -1176,7 +1531,8 @@ async def download_message(
                 key_store=AuthKeyStore(cfg.authkeys_file),
                 extra_clients=extra,
                 resume_offsets=resume_offsets, on_chunk=on_chunk,
-                on_conns=on_conns, on_progress=on_progress,
+                on_conns=on_conns, on_ready=on_ready, on_progress=on_progress,
+                stagger=stagger, locations=locations,
             )
         except errors.FileReferenceExpiredError as exc:
             raise FastError(

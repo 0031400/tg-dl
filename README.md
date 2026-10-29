@@ -166,11 +166,13 @@ uv run tgdl download 8913476869:6799 --auth-keys 3 -c 16
   "home_dc": 5,
   "home_ip": "91.108.56.196",
   "home_port": 443,
-  "keys": {"4": ["<hex>", "..."], "5": ["<hex>"]}
+  "sessions": {"1": "<hex>"},
+  "keys": {"4": ["<hex>", "..."]}
 }
 ```
 
-`home_*` 只回答「没有 key 时从哪个 DC 开始连」。所以：
+`sessions` 是每个**登录会话**的 key（`1` → `.tgdl/fast`，`2` → `.tgdl/fast2`），
+`keys` 是各个 DC 的派生 key（可多条，地位平等）。`home_*` 只回答「从哪个 DC 开始连」。所以：
 
 > **换机器 / 换账号 = 替换这一个文件。** 把 `authkeys.json` 拷到另一台机器的 `.tgdl/` 下
 > 就等于登录了，不用验证码。实测把 `fast.session` 整个删掉、只留 `authkeys.json`，
@@ -310,7 +312,7 @@ Telethon 的 AES-IGE 加解密有三档实现：`cryptg`（C 扩展）→ `libss
 | 命令 | 作用 |
 | --- | --- |
 | `tgdl init` | 写 `./.tgdl/config.toml` |
-| `tgdl login [--engine tdlib\|fast\|all]` | 登录（会话持久化在 `.tgdl/`） |
+| `tgdl login [--engine tdlib\|fast\|all] [--sessions N]` | 登录；`--sessions N` 一次登 N 个会话，验证码只问一次 |
 | `tgdl logout` | 退出登录并清理会话 |
 | `tgdl whoami` | 两个引擎的登录状态 |
 | `tgdl info <chat_id:message_id>` | 看文件名 / 大小 / 类型 / DC，不下载 |

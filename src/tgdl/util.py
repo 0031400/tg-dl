@@ -35,6 +35,27 @@ def parse_size(text: str) -> int:
     return int(float(text))
 
 
+_QUOTE_PAIRS = {
+    "'": "'",
+    '"': '"',
+    "`": "`",
+    "“": "”",
+    "‘": "’",
+}
+
+
+def strip_quotes(text: str) -> str:
+    """去掉首尾成对的引号。
+
+    Windows 的 cmd 不认单引号，``'-100123:45'`` 会原样传进来（引号也算字符），
+    所以这里替用户剥掉一层，省得他换 shell 才知道怎么回事。
+    """
+    out = (text or "").strip()
+    while len(out) >= 2 and out[0] in _QUOTE_PAIRS and out[-1] == _QUOTE_PAIRS[out[0]]:
+        out = out[1:-1].strip()
+    return out
+
+
 def parse_target(text: str) -> tuple[int, int]:
     """解析 ``chat_id:message_id``。
 
@@ -43,16 +64,23 @@ def parse_target(text: str) -> tuple[int, int]:
 
     message_id 两种写法都接受：MTProto 的原始 id（如 ``6733``），
     或 TDLib 的 id（``6733 << 20``）。
+
+    首尾多包一层引号也能接受（cmd 下经常这么写）。
     """
-    raw = (text or "").strip()
+    raw = strip_quotes(text)
+    if not raw:
+        raise ValueError("格式应为 chat_id:message_id，收到的是空字符串")
     if ":" not in raw:
         raise ValueError(f"格式应为 chat_id:message_id，收到的是 {raw!r}")
     left, _, right = raw.partition(":")
     try:
-        chat_id = int(left.strip())
-        message_id = int(right.strip())
+        chat_id = int(strip_quotes(left))
+        message_id = int(strip_quotes(right))
     except ValueError as exc:
-        raise ValueError(f"chat_id 和 message_id 都必须是整数，收到的是 {raw!r}") from exc
+        raise ValueError(
+            f"chat_id 和 message_id 都必须是整数，收到的是 {raw!r}"
+            f"（chat_id={left.strip()!r}，message_id={right.strip()!r}）"
+        ) from exc
     if message_id <= 0:
         raise ValueError(f"message_id 必须是正整数，收到 {message_id}")
     return chat_id, message_id

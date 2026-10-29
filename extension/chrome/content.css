@@ -1,0 +1,65 @@
+/* 每条消息下面的 chat_id:message_id 小条。
+   刻意只用 currentColor / rgba，跟随 Telegram 自己的明暗主题走。 */
+
+.tgdl-idrow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  box-sizing: border-box;
+  /* 父级是 grid 时占满一整行；是 flex 时尽量单独一行；都不是就是普通块 */
+  grid-column: 1 / -1;
+  flex: 0 0 100%;
+  order: 99;
+  margin: 3px 0 0;
+  padding: 0 2px;
+  font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, "Courier New", monospace;
+  color: currentColor;
+  opacity: 0.55;
+  user-select: text;
+}
+
+.tgdl-idrow:hover {
+  opacity: 1;
+}
+
+.tgdl-idrow code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(127, 127, 127, 0.16);
+  white-space: nowrap;
+  user-select: all;   /* 双击一下就能整段选中 */
+}
+
+.tgdl-idrow.warn code {
+  background: rgba(220, 140, 0, 0.2);
+}
+
+.tgdl-idrow button {
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid rgba(127, 127, 127, 0.45);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1.4;
+  cursor: pointer;
+  opacity: 0.9;
+}
+
+.tgdl-idrow button:hover {
+  background: rgba(127, 127, 127, 0.18);
+}
+
+.tgdl-idrow button.ok {
+  border-color: rgba(30, 160, 90, 0.8);
+  color: rgb(30, 160, 90);
+  opacity: 1;
+}
+
+.tgdl-idrow button.bad {
+  border-color: rgba(210, 75, 75, 0.8);
+  color: rgb(210, 75, 75);
+  opacity: 1;
+}

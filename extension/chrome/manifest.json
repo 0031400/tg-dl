@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "tgdl 消息 ID",
+  "version": "1.0.0",
+  "description": "在 Telegram Web 每条消息下面显示 chat_id:message_id，一键复制给 tgdl 用",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://web.telegram.org/a/*",
+        "https://web.telegram.org/k/*",
+        "https://web.telegram.org/z/*"
+      ],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

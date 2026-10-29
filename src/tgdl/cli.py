@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -112,6 +114,10 @@ def login(
         1, "--session",
         help="fast 引擎的会话序号（1=fast，2=fast2…）。多会话可叠加吞吐",
     ),
+    sessions: int = typer.Option(
+        0, "--sessions",
+        help="一次登录 N 个会话（1..N），验证码/密码只问一次、自动复用；0 表示只登 --session 指定的那个",
+    ),
     verbosity: int = typer.Option(1, "--verbosity", help="TDLib 日志级别"),
 ) -> None:
     """登录（tdlib 引擎 / fast 引擎，各自维护自己的会话）。"""
@@ -123,16 +129,36 @@ def login(
         if engine in ("all", "tdlib"):
             _login_tdlib(cfg, phone, verbosity)
         if engine in ("all", "fast"):
-            message = _run(
-                fast.login(
-                    cfg,
-                    phone=phone,
-                    ask_code=lambda: typer.prompt("验证码"),
-                    ask_password=lambda: typer.prompt("两步验证密码", hide_input=True),
-                    session_index=session,
+            indexes = [session] if sessions <= 0 else list(range(1, sessions + 1))
+            cache: dict[str, str | None] = {"code": None, "pwd": None}
+
+            def ask_code(attempt: int = 0) -> str:
+                # attempt > 0 说明上次的码错了，必须重新问
+                if attempt > 0 or cache["code"] is None:
+                    cache["code"] = typer.prompt("验证码")
+                return cache["code"]
+
+            def ask_password(attempt: int = 0) -> str:
+                if attempt > 0 or cache["pwd"] is None:
+                    cache["pwd"] = typer.prompt("两步验证密码", hide_input=True)
+                return cache["pwd"]
+
+            for index in indexes:
+                if len(indexes) > 1:
+                    console.print(
+                        f"[cyan]—— 会话 #{index}/{len(indexes)}"
+                        f"（{cfg.fast_session_at(index).name}）——[/cyan]"
+                    )
+                message = _run(
+                    fast.login(
+                        cfg,
+                        phone=phone,
+                        ask_code=ask_code,
+                        ask_password=ask_password,
+                        session_index=index,
+                    )
                 )
-            )
-            console.print(f"[green]{message}[/green]")
+                console.print(f"[green]{message}[/green]")
     except (TdlibLoadError, TdlibError, fast.FastError, TimeoutError) as exc:
         _fail(str(exc))
 
@@ -175,10 +201,17 @@ def whoami(verbosity: int = typer.Option(1, "--verbosity")) -> None:
     except (TdlibLoadError, TdlibError) as exc:
         table.add_row("tdlib", f"[red]{exc}[/red]")
     try:
-        me = _run(fast.whoami(cfg))
-        table.add_row("fast", me or "[yellow]未登录[/yellow]")
-    except fast.FastError as exc:
-        table.add_row("fast", f"[red]{exc}[/red]")
+        store = fast.AuthKeyStore(cfg.authkeys_file)
+        indices = store.session_indices() or [1]
+    except Exception:  # noqa: BLE001
+        indices = [1]
+    for idx in indices:
+        label = "fast" if idx == 1 else f"fast #{idx}"
+        try:
+            me = _run(fast.whoami(cfg, session_index=idx))
+            table.add_row(label, me or "[yellow]未登录[/yellow]")
+        except fast.FastError as exc:
+            table.add_row(label, f"[red]{exc}[/red]")
     console.print(table)
 
 
@@ -273,11 +306,26 @@ def download(
         False, "--fixed",
         help="固定并发，不做自适应调节（撞限流只等待、不降并发）",
     ),
+    stagger: bool = typer.Option(
+        False, "--stagger",
+        help="首发错峰：开局请求按 50ms→3ms 摊开，避免几十个查询同一瞬间砸过去",
+    ),
+    pick: int = typer.Option(
+        0, "--pick",
+        help="相册里选第几个文件（从 1 开始）；不填则自动下载体积最大的那个",
+    ),
     auth_keys: int = typer.Option(
         1, "--auth-keys",
         help=(
             "并行使用的独立 auth key 总数（含主会话）。优先用 .tgdl/authkeys.json 里缓存的，"
             "不够的部分现场 DH 生成并写回缓存；无需额外登录"
+        ),
+    ),
+    sessions: int = typer.Option(
+        1, "--sessions",
+        help=(
+            "用几个**登录会话**（.tgdl/fast、fast2…）。每个会话各自再派生 auth key；"
+            "需要先 `tgdl login --engine fast --session N`"
         ),
     ),
     verbosity: int = typer.Option(1, "--verbosity"),
@@ -296,10 +344,10 @@ def download(
         engine = "fast" if _run(fast.whoami(cfg)) else "tdlib"
 
     if engine == "fast":
-        total_inflight = auth_keys * connections
+        total_inflight = auth_keys * sessions * connections
         if total_inflight > 32:
             console.print(
-                f"[yellow]提示：{auth_keys} 条连接 × 每条 {connections} 个在途 = "
+                f"[yellow]提示：{sessions} 会话 × {auth_keys} 条 key × 每条 {connections} 个在途 = "
                 f"{total_inflight} 个并发请求，容易触发 FLOOD_WAIT（建议 ≤ 32）[/yellow]"
             )
         if auth_keys > 8:
@@ -314,6 +362,7 @@ def download(
                         cfg, chat_id, message_id, output,
                         connections=connections, chunk=chunk_bytes,
                         adaptive=not fixed, auth_keys=auth_keys,
+                        sessions=sessions, stagger=stagger, pick=pick,
                         on_conns=bar.update_conns, on_progress=bar.update,
                     )
                 )
@@ -528,13 +577,14 @@ def doctor(verbosity: int = typer.Option(1, "--verbosity")) -> None:
 
     try:
         store = fast.AuthKeyStore(cfg.authkeys_file)
-        per_dc = {dc: len(v) for dc, v in store._keys.items() if v}
+        per_dc = {str(dc): n for dc, n in store.per_dc_counts().items() if n}
     except Exception:  # noqa: BLE001
         store, per_dc = None, {}
     if per_dc:
         detail = "，".join(f"DC{dc} {n} 条" for dc, n in sorted(per_dc.items(), key=lambda kv: int(kv[0])))
         home = f"｜主 DC{store.home_dc}" if store and store.home_dc else ""
-        table.add_row("auth key", f"{sum(per_dc.values())} 条（{detail}{home}）")
+        accounts = f"｜{len(store.session_indices())} 个登录会话" if store else ""
+        table.add_row("auth key", f"{sum(per_dc.values())} 条（{detail}{home}{accounts}）")
     else:
         table.add_row(
             "auth key 缓存",
@@ -588,5 +638,29 @@ def version() -> None:
     console.print(f"tgdl {__version__}")
 
 
-if __name__ == "__main__":  # pragma: no cover
+_TARGET_ARG = re.compile(r"""^['"`]?-\d+:\d+['"`]?$""")
+
+
+def _rescue_negative_target(argv: list[str]) -> None:
+    """把「长得像选项」的目标挪到 ``--`` 后面。
+
+    click 看到以 ``-`` 开头的参数就当选项，``tgdl download -100123:45`` 会直接报
+    ``No such option: -1``。所有命令的目标都是唯一的位置参数，所以把它挪到末尾、
+    前面补一个 ``--`` 就能正常解析（选项仍留在前面，不受影响）。
+    """
+    if "--" in argv:
+        return
+    for i in range(1, len(argv)):
+        if _TARGET_ARG.match(argv[i]):
+            argv.append("--")
+            argv.append(argv.pop(i))
+            return
+
+
+def main() -> None:  # pragma: no cover
+    _rescue_negative_target(sys.argv)
     app()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

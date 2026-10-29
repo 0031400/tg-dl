@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-tgdl = "tgdl.cli:app"
+tgdl = "tgdl.cli:main"
 
 [build-system]
 requires = ["hatchling"]
